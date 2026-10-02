@@ -1,0 +1,5 @@
+# Pretty URLs for the examples under Apache (Helm, cPanel).
+RewriteEngine On
+RewriteRule ^pay/([a-f0-9]{64})$ pay.php?token=$1 [L,QSA]
+RewriteRule ^checkout/([a-f0-9]{64})$ checkout.php?token=$1 [L,QSA]
+RewriteRule ^webhooks/authorizenet$ webhook.php [L]

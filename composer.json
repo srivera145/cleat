@@ -1,0 +1,46 @@
+{
+    "name": "echodial/cleat",
+    "description": "Self-hosted billing and invoicing for PHP: subscriptions, invoices, hosted pay pages and payment links over Authorize.net, with all billing state in your own MySQL/MariaDB.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["billing", "invoicing", "subscriptions", "authorize.net", "payments", "keel"],
+    "authors": [
+        {
+            "name": "EchoDial LLC"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "ext-curl": "*",
+        "ext-json": "*",
+        "ext-pdo": "*"
+    },
+    "require-dev": {
+        "echodial/deck": "^0.1.3",
+        "phpunit/phpunit": "^11.5"
+    },
+    "suggest": {
+        "ext-pdo_mysql": "Cleat stores all billing state in MySQL 8 or MariaDB 10.11+."
+    },
+    "autoload": {
+        "psr-4": {
+            "Cleat\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Cleat\\Tests\\": "tests/"
+        }
+    },
+    "bin": [
+        "bin/cleat-run.php"
+    ],
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

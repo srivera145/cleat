@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="tests/bootstrap.php"
+         colors="true"
+         cacheDirectory=".phpunit.cache"
+         failOnWarning="true"
+         failOnRisky="true"
+         beStrictAboutOutputDuringTests="true">
+    <testsuites>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory>tests/Feature</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>src</directory>
+        </include>
+    </source>
+    <php>
+        <!-- MariaDB 10.11+ or MySQL 8. The database is created if missing and rebuilt on every run. -->
+        <env name="CLEAT_TEST_DB_HOST" value="127.0.0.1" force="false"/>
+        <env name="CLEAT_TEST_DB_PORT" value="3306" force="false"/>
+        <env name="CLEAT_TEST_DB_NAME" value="cleat_test" force="false"/>
+        <env name="CLEAT_TEST_DB_USER" value="root" force="false"/>
+        <env name="CLEAT_TEST_DB_PASS" value="" force="false"/>
+    </php>
+</phpunit>
