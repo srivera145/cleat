@@ -3,8 +3,10 @@
 declare(strict_types=1);
 
 /*
- * Creates (or resets) the cleat_demo database with sample data and prints
- * links to try. Uses the FakeGateway, so no Authorize.net account is needed.
+ * Creates (or resets) the demo database with sample data and prints links to
+ * try. Without Authorize.net keys it uses cleat_demo and the FakeGateway, so no
+ * account is needed. With sandbox keys in examples/.env it uses cleat_sandbox
+ * and creates the sample customer's CIM profile in the Authorize.net sandbox.
  *
  *   php examples/seed.php
  *   php -S localhost:8080 -t examples/public examples/public/router.php
@@ -16,9 +18,12 @@ use Cleat\Price;
 use Cleat\Product;
 use Cleat\Support\Schema;
 
-$dsn = getenv('CLEAT_DB_DSN') ?: 'mysql:host=127.0.0.1;port=3306;dbname=cleat_demo;charset=utf8mb4';
+require_once __DIR__ . '/env.php';
+
+$dbName = example_uses_authorizenet() ? 'cleat_sandbox' : 'cleat_demo';
+$dsn = example_env('CLEAT_DB_DSN', "mysql:host=127.0.0.1;port=3306;dbname=$dbName;charset=utf8mb4");
 if (preg_match('/dbname=([A-Za-z0-9_]+)/', $dsn, $m) === 1) {
-    $server = new PDO(preg_replace('/dbname=[A-Za-z0-9_]+;?/', '', $dsn), getenv('CLEAT_DB_USER') ?: 'root', getenv('CLEAT_DB_PASS') ?: '');
+    $server = new PDO(preg_replace('/dbname=[A-Za-z0-9_]+;?/', '', $dsn), example_env('CLEAT_DB_USER', 'root'), example_env('CLEAT_DB_PASS'));
     $server->exec("CREATE DATABASE IF NOT EXISTS `{$m[1]}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
 }
 
@@ -45,8 +50,9 @@ $trialLink = PaymentLink::create('team-monthly', ['allow_quantity_change' => tru
 $guideLink = PaymentLink::create('field-guide', ['max_uses' => 100]);
 
 $mail = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'cleat-demo-mail';
+$mode = \Cleat\Cleat::isFake() ? 'FakeGateway: pick a test card on the payment form' : 'Authorize.net sandbox: use a sandbox test card';
 fwrite(STDOUT, <<<TXT
-Cleat demo data created (FakeGateway: pick a test card on the payment form).
+Cleat demo data created ($mode).
 
   Invoice {$invoice->number}:  {$invoice->paymentUrl()}
   Subscription link:     {$trialLink->url()}

@@ -110,7 +110,7 @@ $title = ($isPaidState ? 'Invoice ' . $invoice->number . ' (paid)' : 'Pay invoic
             <dl class="stack stack-2 text-sm">
               <div class="bar"><dt class="text-muted">Amount paid</dt><dd class="push fw-semi nums"><?= $e($invoice->money($invoice->amount_paid)) ?></dd></div>
               <div class="bar"><dt class="text-muted">Invoice</dt><dd class="push mono"><?= $e($invoice->number) ?></dd></div>
-<?php if ($charge !== null && $savedCard !== null): ?>
+<?php if ($charge !== null && $charge->source->value === 'stored_profile' && $savedCard !== null): ?>
               <div class="bar"><dt class="text-muted">Card</dt><dd class="push"><?= $e($savedCard) ?></dd></div>
 <?php endif; ?>
             </dl>

@@ -106,6 +106,23 @@ final class InvoicePayPageTest extends TestCase
         $this->assertSame(25000, $this->gateway->callsTo('chargeProfile')[0]['args']['amount']);
     }
 
+    /** Sandbox regression: paying with a different card must not name the saved card as the one charged. */
+    public function test_receipt_names_the_saved_card_only_when_it_was_charged(): void
+    {
+        $customer = $this->customer('two-cards@example.com', 'tok_visa');
+
+        $other = $customer->newInvoice()->addItem('Paid with another card', 2345)->send();
+        $response = $this->submit($other, ['payment_method' => 'new'] + self::opaque('tok_mastercard'));
+        $this->assertStringContainsString('Payment received. Thank you!', $response->body);
+        $this->assertSame(ChargeSource::OneTimeToken, $other->refresh()->charges()[0]->source);
+        $this->assertStringNotContainsString('Visa ending 4242', $response->body, 'the saved card was not charged');
+
+        $saved = $customer->newInvoice()->addItem('Paid with the saved card', 3456)->send();
+        $response = $this->submit($saved, ['payment_method' => 'saved']);
+        $this->assertStringContainsString('Payment received. Thank you!', $response->body);
+        $this->assertStringContainsString('Visa ending 4242', $response->body);
+    }
+
     /** Self-check 9, part 5: a past_due subscription returns to active when its invoice is paid on the page. */
     public function test_paying_a_past_due_invoice_reactivates_the_subscription(): void
     {
@@ -222,6 +239,25 @@ final class InvoicePayPageTest extends TestCase
         $this->assertNotEmpty($m[1] ?? null);
         $this->assertStringContainsString('<script nonce="' . $m[1] . '">', $response->body, 'inline script carries the nonce');
         $this->assertStringContainsString('<style nonce="' . $m[1] . '">', $response->body);
+    }
+
+    /**
+     * Sandbox regression: Accept.js fetches AcceptCore.js from its own host
+     * before falling back to a script tag. Without that host in connect-src,
+     * Chrome logged a CSP violation on every card page.
+     */
+    public function test_csp_lets_accept_js_fetch_its_core_from_its_own_host(): void
+    {
+        $invoice = $this->sentInvoice();
+        foreach ([[true, 'https://jstest.authorize.net', 'https://apitest.authorize.net'], [false, 'https://js.authorize.net', 'https://api2.authorize.net']] as [$sandbox, $acceptJs, $api]) {
+            $this->reconfigure(['authorizenet' => ['sandbox' => $sandbox]]);
+            $csp = (string) (new InvoicePayPage(self::SESSION))->show($invoice->public_token)->header('Content-Security-Policy');
+            preg_match('/connect-src ([^;]+)/', $csp, $connect);
+            preg_match('/script-src ([^;]+)/', $csp, $script);
+            $this->assertContains($acceptJs, explode(' ', $connect[1] ?? ''), 'connect-src allows the Accept.js host');
+            $this->assertContains($api, explode(' ', $connect[1] ?? ''));
+            $this->assertContains($acceptJs, explode(' ', $script[1] ?? ''));
+        }
     }
 
     public function test_paying_twice_never_charges_twice(): void

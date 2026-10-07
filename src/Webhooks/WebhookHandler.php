@@ -26,7 +26,8 @@ use Throwable;
  *   $response = (new WebhookHandler())->handle(file_get_contents('php://input'), getallheaders());
  *
  * 1. Verify X-ANET-Signature ("sha512=" + uppercase hex HMAC-SHA512 of the
- *    raw body) with hash_equals. Mismatch -> 401.
+ *    raw body, keyed with the Signature Key string) with hash_equals.
+ *    Mismatch -> 401.
  * 2. Store the event keyed on notificationId. A notification that was already
  *    processed -> 200 with no processing.
  * 3. Reconcile against cleat_charges by transaction id. Unknown types are
@@ -87,29 +88,16 @@ final class WebhookHandler
     }
 
     /**
-     * Authorize.net documents the key as the 128-hex-character Signature Key.
-     * The spec for Cleat says to key the HMAC with hex2bin(signature_key);
-     * Authorize.net's published community examples key it with the hex
-     * string itself. Until this is checked against a live sandbox both forms
-     * are accepted. Each needs the secret, so neither weakens the check.
+     * The HMAC key is the Signature Key exactly as the merchant interface
+     * shows it: the 128-character hex string itself, not hex2bin() of it.
+     * Checked against real sandbox notifications (see SANDBOX.md).
      */
     public static function verify(string $rawBody, string $header, string $signatureKey): bool
     {
         if (preg_match('/^sha512=([A-Fa-f0-9]{128})$/D', trim($header), $m) !== 1) {
             return false;
         }
-        $given = strtoupper($m[1]);
-        $keys = [];
-        if (strlen($signatureKey) % 2 === 0 && ctype_xdigit($signatureKey)) {
-            $keys[] = (string) hex2bin($signatureKey);
-        }
-        $keys[] = $signatureKey;
-        $valid = false;
-        foreach ($keys as $key) {
-            // Evaluate every candidate so timing does not reveal which form matched.
-            $valid = hash_equals(strtoupper(hash_hmac('sha512', $rawBody, $key)), $given) || $valid;
-        }
-        return $valid;
+        return hash_equals(strtoupper(hash_hmac('sha512', $rawBody, $signatureKey)), strtoupper($m[1]));
     }
 
     /** @param array<string, mixed> $p */
@@ -228,12 +216,25 @@ final class WebhookHandler
         $this->recordExternalRefund($charge, $amount, RefundMethod::Refund, $refundTransId);
     }
 
-    /** @param array<string, mixed> $p */
+    /**
+     * A void of a succeeded charge is a refund made outside Cleat. A void of a
+     * held charge is how a fraud review ends in a decline: Authorize.net voids
+     * the held transaction and sends void.created alongside, and in the
+     * sandbox a few milliseconds before, fraud.declined. Whichever arrives
+     * first settles the review as declined, so dunning and PaymentFailed run
+     * either way; the other then finds nothing held.
+     *
+     * @param array<string, mixed> $p
+     */
     private function voided(array $p): void
     {
         $transId = (string) ($p['id'] ?? '');
         $charge = $transId !== '' ? Charge::findByTransactionId($transId) : null;
-        if ($charge === null || $charge->status === ChargeStatus::Voided) {
+        if ($charge === null || in_array($charge->status, [ChargeStatus::Voided, ChargeStatus::Failed], true)) {
+            return;
+        }
+        if ($charge->status === ChargeStatus::Held) {
+            $this->fraudResolved($p, false);
             return;
         }
         $this->deferIfRefundInFlight($charge);

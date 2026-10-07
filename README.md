@@ -53,7 +53,7 @@ Until a Connect driver ships, anything given a connected account throws
 19. [Connect (stub)](#connect-stub)
 20. [Testing](#testing)
 21. [Schema notes](#schema-notes)
-22. [Not yet verified against a live sandbox](#not-yet-verified-against-a-live-sandbox)
+22. [Verified against the Authorize.net sandbox](#verified-against-the-authorizenet-sandbox)
 
 ---
 
@@ -424,8 +424,9 @@ $response = (new WebhookHandler())->handle(file_get_contents('php://input'), get
 ```
 
 - The `X-ANET-Signature` header (`sha512=` + uppercase hex HMAC-SHA512 of the
-  raw body) is checked with `hash_equals`. A mismatch, or no configured
-  signature key, returns 401.
+  raw body, keyed with the Signature Key string exactly as the merchant
+  interface shows it) is checked with `hash_equals`. A mismatch, or no
+  configured signature key, returns 401.
 - Events are stored keyed on `notificationId`. An event that was already
   processed returns 200 and does nothing. A processing error returns 500 so
   Authorize.net retries, and the event stays unprocessed until a retry succeeds.
@@ -636,26 +637,24 @@ with four small additions:
 All amounts are `BIGINT` cents. All timestamps are `DATETIME` written in UTC,
 so the connection's time zone can never shift them.
 
-## Not yet verified against a live sandbox
+## Verified against the Authorize.net sandbox
 
-Everything above is covered by tests against the `FakeGateway` and a recorded
-Authorize.net transport. These pieces have **not** been exercised against a
-real Authorize.net sandbox yet, and should be before the first live charge:
+Version 0.1.1 was run end to end against a live Authorize.net sandbox:
+CIM profiles from real Accept.js tokens, approvals, declines, errors and
+fraud holds (approved and declined), the refund → error 54 → void fallback,
+`findTransaction` timeout recovery, signed webhooks, and the hosted checkout
+and invoice pages in Chrome under Cleat's CSP. [SANDBOX.md](SANDBOX.md) has
+the results, the test triggers that work, and how to repeat the pass with
+`examples/sandbox-check.php`.
 
-- CIM customer and payment profile creation from a real Accept.js nonce,
-  including `validationMode` and reading back brand, last four and expiry.
-- `chargeToken` and `chargeProfile` responses for real approvals, declines
-  and fraud holds.
-- The refund → error 54 → void fallback on a real unsettled transaction.
-- `findTransaction` (timeout reconciliation) against a real
-  `getUnsettledTransactionListRequest` response. It only sees transactions
-  that have not settled yet (settlement is roughly daily), so the webhook
-  remains the backstop for anything older. Configure webhooks.
-- Webhook signatures with a real signature key. The spec keys the HMAC with
-  `hex2bin(signature_key)`; Authorize.net's community examples key it with
-  the hex string itself. Cleat accepts both until this is confirmed.
-- Accept.js loading and tokenizing in a real browser under Cleat's CSP
-  (`script-src js[test].authorize.net`, `connect-src api2/apitest.authorize.net`).
+Still unverified, and worth checking before the first live charge:
+
+- A refund of a **settled** transaction. Sandbox batches settle once a day;
+  run `php examples/sandbox-check.php --refund-settled` the day after a pass.
+- `findTransaction` only sees transactions that have not settled yet, so the
+  webhook remains the backstop for anything older. Configure webhooks.
+- Production endpoints (`api.authorize.net`, `js.authorize.net`) and live
+  card networks. The sandbox never reaches a processor.
 - Stored-credential (card-on-file) indicators on recurring charges, which
   can improve approval rates. Cleat does not send them yet.
 
