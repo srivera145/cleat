@@ -44,6 +44,7 @@ final class Charge
         public ?array $raw_response,
         public readonly DateTimeImmutable $created_at,
         public DateTimeImmutable $updated_at,
+        public ?string $network_transaction_id = null,
     ) {
     }
 
@@ -227,11 +228,13 @@ final class Charge
             'reason_code' => $result->reasonCode !== null ? mb_substr($result->reasonCode, 0, 32) : null,
             'reason_text' => $result->reasonText !== null ? mb_substr($result->reasonText, 0, 500) : null,
             'raw_response' => $result->raw === [] ? null : $result->raw,
+            'network_transaction_id' => $result->networkTransactionId,
             'updated_at' => Cleat::now(),
         ];
         Db::update('cleat_charges', $fields, ['id' => $this->id]);
         $this->status = $status;
         $this->gateway_transaction_id = $result->transactionId;
+        $this->network_transaction_id = $result->networkTransactionId;
         $this->response_code = $result->responseCode;
         $this->reason_code = $fields['reason_code'];
         $this->reason_text = $fields['reason_text'];
@@ -305,6 +308,7 @@ final class Charge
             $row['raw_response'] !== null ? json_decode((string) $row['raw_response'], true) : null,
             Db::date($row['created_at']),
             Db::date($row['updated_at']),
+            isset($row['network_transaction_id']) ? (string) $row['network_transaction_id'] : null,
         );
     }
 }

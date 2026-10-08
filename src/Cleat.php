@@ -27,7 +27,7 @@ use PDO;
  */
 final class Cleat
 {
-    public const VERSION = '0.1.1';
+    public const VERSION = '0.1.2';
 
     /** Used only when gateway = 'fake' and no app_key is set. Never secret. */
     private const FAKE_MODE_APP_KEY = 'cleat-fake-mode-insecure-app-key-do-not-use-in-production';
@@ -70,6 +70,7 @@ final class Cleat
         self::$events = null;
         self::$clock = null;
         Log::setLogger(null);
+        Customer::resetNotices();
     }
 
     public static function isConfigured(): bool

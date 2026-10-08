@@ -212,6 +212,8 @@ final class WebhookTest extends TestCase
     public function test_payment_profile_deleted_clears_the_card(): void
     {
         $customer = $this->customer('card@example.com');
+        $customer->invoiceFor('Order', 1000);
+        $this->assertNotNull($customer->refresh()->original_network_transaction_id);
         $body = $this->body('net.authorize.customer.paymentProfile.deleted', [
             'customerProfileId' => $customer->gateway_customer_id, 'entityName' => 'customerPaymentProfile', 'id' => $customer->gateway_payment_id,
         ]);
@@ -220,6 +222,7 @@ final class WebhookTest extends TestCase
         $this->assertFalse($customer->hasPaymentMethod());
         $this->assertNull($customer->card_last_four);
         $this->assertNull($customer->card_brand);
+        $this->assertNull($customer->original_network_transaction_id, 'the id belonged to the deleted card');
     }
 
     public function test_refund_and_void_made_outside_cleat_are_recorded(): void

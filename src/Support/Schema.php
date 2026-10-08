@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cleat\Support;
 
+use Cleat\Exceptions\CleatException;
 use PDO;
 
 /**
@@ -13,6 +14,36 @@ use PDO;
  */
 final class Schema
 {
+    /** @var array<int, true> connections already checked by assertMigrated() */
+    private static array $migrated = [];
+
+    /**
+     * Throws unless the database has the columns this version writes. Called
+     * before a card is saved or charged, so a host that upgraded Cleat without
+     * running the new migration finds out before any money moves, not while
+     * recording a payment that already went through. Checked once per
+     * connection per process.
+     */
+    public static function assertMigrated(PDO $pdo): void
+    {
+        $key = spl_object_id($pdo);
+        if (isset(self::$migrated[$key])) {
+            return;
+        }
+        $found = (int) $pdo->query(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND (
+                (table_name = 'cleat_customers' AND column_name = 'original_network_transaction_id')
+                OR (table_name = 'cleat_charges' AND column_name = 'network_transaction_id'))",
+        )->fetchColumn();
+        if ($found !== 2) {
+            throw new CleatException(
+                'The Cleat database is not up to date: run database/migrations/002_stored_credentials.sql '
+                . '(additive and safe on a live database), or Schema::migrate($pdo).'
+            );
+        }
+        self::$migrated[$key] = true;
+    }
+
     /** @return list<string> the files that were executed */
     public static function migrate(PDO $pdo): array
     {

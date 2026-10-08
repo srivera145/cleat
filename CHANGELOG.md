@@ -4,6 +4,62 @@ All notable changes to Cleat are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Cleat uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-10-07
+
+Stored-credential (card-on-file) indicators on every charge of a saved card.
+Run `database/migrations/002_stored_credentials.sql` when upgrading; see
+"Upgrading" in the README.
+
+### Added
+
+- Every charge of a saved card says who started it and why, as Visa and
+  Mastercard's stored credential framework expects:
+  - A new subscription's first payment (`newSubscription()->create()`,
+    checkout for a recurring price) is sent as the first customer-initiated
+    transaction of a recurring series (`isFirstRecurringPayment`).
+  - The pay page's "save this card" charge is the card's first
+    customer-initiated transaction.
+  - Paying with the saved card on the pay page is a customer-initiated
+    stored-credential transaction (`isStoredCredentials`).
+  - Renewals and trial conversions are merchant-initiated recurring
+    transactions (`recurringBilling`, `isSubsequentAuth`) and carry the
+    card's original network transaction ID.
+  - Dunning retries are merchant-initiated resubmissions
+    (`reason=resubmission`) with the original ID.
+  - `$customer->charge()`, `invoiceFor()`, `swap()` and `$invoice->pay()` are
+    merchant-initiated unscheduled transactions.
+  - One-time cards that are not saved carry no indicators.
+- `Gateway\StoredCredential`, the indicators as a value object (initiator,
+  type, first, original network transaction ID, reason).
+  `$invoice->pay(storedCredential: ...)` lets an app mark a charge as
+  customer-initiated.
+- The network transaction ID of every charge is stored in
+  `cleat_charges.network_transaction_id`. The saved card's original ID, from
+  its first approved stored-credential charge or, in production, from CIM's
+  `liveMode` validation, is stored in
+  `cleat_customers.original_network_transaction_id`. It is cleared whenever
+  the card changes or is deleted.
+- A card with no original ID on file (saved before 0.1.2, or saved in the
+  sandbox and never charged) gets the merchant-initiated flags without it.
+  One notice is logged per customer, and the next approved charge's ID is
+  kept.
+- `examples/sandbox-check.php --stored-credential` sends every kind of charge
+  to the sandbox. It prints the card-on-file fields of each request as sent
+  and the IDs that came back, and checks what Authorize.net recorded.
+- `FakeGateway` records the `StoredCredential` passed to each charge and
+  returns network transaction IDs. `$liveValidation` and
+  `$returnNetworkTransIds` simulate production card saves and processors
+  that return no ID.
+
+### Changed
+
+- `GatewayInterface::chargeProfile()` takes a last parameter,
+  `?StoredCredential $storedCredential = null`. Custom gateways must add it.
+- `GatewayResult` has a `networkTransactionId` property.
+- Migration 002 adds two nullable columns. It is additive, instant on MySQL 8
+  and MariaDB 10.11, and safe to run twice. Cleat refuses to save or charge a
+  card until it has run, so a missing migration fails before any money moves.
+
 ## [0.1.1] - 2026-10-07
 
 The first pass against a live Authorize.net sandbox. What was tested, the
@@ -82,5 +138,6 @@ First release of Cleat Billing.
 - The Authorize.net gateway has not yet been run against a live sandbox. See
   "Not yet verified against a live sandbox" in the README.
 
+[0.1.2]: https://github.com/srivera145/cleat/releases/tag/v0.1.2
 [0.1.1]: https://github.com/srivera145/cleat/releases/tag/v0.1.1
 [0.1.0]: https://github.com/srivera145/cleat/releases/tag/v0.1.0

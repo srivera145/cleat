@@ -294,7 +294,8 @@ final class WebhookHandler
             return;
         }
         Db::run(
-            'UPDATE cleat_customers SET gateway_payment_id = NULL, card_brand = NULL, card_last_four = NULL, card_exp = NULL, updated_at = ?
+            'UPDATE cleat_customers SET gateway_payment_id = NULL, card_brand = NULL, card_last_four = NULL, card_exp = NULL,
+                original_network_transaction_id = NULL, updated_at = ?
              WHERE gateway_customer_id = ? AND gateway_payment_id = ?',
             [Cleat::now(), $profileId, $paymentProfileId],
         );

@@ -16,6 +16,10 @@ declare(strict_types=1);
  *                                                        alone (sandbox delivery can take ~10 minutes)
  *   php examples/sandbox-check.php --profile-deleted[=SECONDS]  a payment profile deleted at the gateway
  *                                                        is cleared locally by its webhook
+ *   php examples/sandbox-check.php --stored-credential   card-on-file indicators: first CIT, MITs with the
+ *                                                        original network transaction id, later CIT, no id,
+ *                                                        one-time token. Prints each request's card-on-file
+ *                                                        fields as sent and the ids that came back
  *
  *   php examples/sandbox-check.php --browser-setup       invoices and checkout links for the browser pass
  *   php examples/sandbox-check.php --report              latest customers, charges, subscriptions, refunds
@@ -50,7 +54,11 @@ use Cleat\Exceptions\RefundFailedException;
 use Cleat\Gateway\AuthorizeNetGateway;
 use Cleat\Gateway\GatewayInterface;
 use Cleat\Gateway\GatewayResult;
+use Cleat\Gateway\StoredCredential;
 use Cleat\Invoice;
+use Cleat\Price;
+use Cleat\Product;
+use Cleat\Subscription;
 use Cleat\Support\Db;
 use Cleat\Support\Log;
 use Cleat\Support\Schema;
@@ -90,9 +98,7 @@ if (!Cleat::isSandbox() || !(Cleat::gateway() instanceof AuthorizeNetGateway) ||
 if (Db::value('SELECT DATABASE()') !== 'cleat_sandbox') {
     fail_hard('This script only uses the cleat_sandbox database (check CLEAT_DB_DSN). Refusing to run.');
 }
-if (Db::value("SHOW TABLES LIKE 'cleat_charges'") === null) {
-    Schema::migrate(Cleat::pdo());
-}
+Schema::migrate(Cleat::pdo()); // every migration is safe to run again
 
 Log::setLogger(static function (string $level, string $message, array $context): void {
     // Cleat redacts contexts itself; they never hold request bodies or keys.
@@ -416,6 +422,148 @@ function profile_deleted(GatewayInterface $gw, int $wait): int
     return $pass ? 0 : 1;
 }
 
+/**
+ * Card-on-file indicators end to end. Every charge's card-on-file request
+ * fields are captured on the wire (CofWire) and printed with the ids that
+ * came back; card data and keys never are.
+ */
+function stored_credential(): int
+{
+    $wire = new CofWire();
+    $gw = new RecordingGateway(new AuthorizeNetGateway(example_env('AUTHORIZENET_LOGIN_ID'), example_env('AUTHORIZENET_TRANSACTION_KEY'), true, $wire->send(...)));
+    Cleat::setGateway($gw);
+    $run = gmdate('His');
+    $results = [];
+    $check = static function (string $id, string $name, bool $pass, string $evidence) use (&$results): void {
+        $results[] = [$id, $name, $pass];
+        out(sprintf('  [%s] %s: %s', $pass ? 'PASS' : 'FAIL', $name, $evidence));
+    };
+    $amount = static fn (): int => 1000 + random_int(1, 8999); // distinct amounts: no duplicate-transaction filter
+
+    out("Cleat stored-credential check, run $run, " . gmdate('Y-m-d H:i:s') . ' UTC');
+    $product = Product::create(['name' => "Sandbox COF $run"]);
+    Price::create($product, ['lookup_key' => "sandbox-cof-$run", 'nickname' => 'Monthly', 'amount' => $amount(), 'billing_type' => 'recurring', 'billing_interval' => 'month']);
+
+    // 1. First CIT: a new subscription with a card saved in the same step.
+    section('1. First CIT: newSubscription()->create($card), no trial');
+    $customer = Customer::create(['email' => "sandbox+$run-cof@example.com", 'name' => 'Sandbox COF']);
+    [$subscription] = attempt(fn () => $customer->newSubscription("sandbox-cof-$run")->create(sandbox_token('4111111111111111', '05', '2031', '123')));
+    $first = $wire->last();
+    $firstCharge = $subscription !== null ? Charge::findOrFail((int) charge_row($subscription->latestInvoice())['id']) : null;
+    $customer = $customer->refresh();
+    $original = $customer->original_network_transaction_id;
+    $check('1', 'first CIT approved, network id stored on charge and card', $firstCharge?->succeeded() === true
+        && $first['request']['processingOptions'] === ['isFirstRecurringPayment' => true] && !isset($first['request']['subsequentAuthInformation'])
+        && $original !== null && $original === ($first['response']['networkTransId'] ?? null) && $firstCharge->network_transaction_id === $original,
+        sprintf('charge %s, customer %d original_network_transaction_id %s', $firstCharge?->id ?? '-', $customer->id, $original ?? 'NULL'));
+
+    // 2. MIT, recurring: the call Runner::charge() makes for renewals and trial conversions.
+    section('2. MIT recurring (renewal): $invoice->pay(storedCredential: StoredCredential::recurring())');
+    $renewal = subscription_invoice($customer, $subscription, 'Sandbox COF renewal', $amount());
+    attempt(fn () => $renewal->pay(storedCredential: StoredCredential::recurring()));
+    $mit = $wire->last();
+    $mitRow = charge_row($renewal);
+    $check('2', 'recurring MIT sent with the original id and approved', $mitRow['status'] === 'succeeded'
+        && ($mit['request']['transactionSettings']['setting'] ?? null) === ['settingName' => 'recurringBilling', 'settingValue' => 'true']
+        && ($mit['request']['processingOptions'] ?? null) === ['isSubsequentAuth' => true]
+        && ($mit['request']['subsequentAuthInformation'] ?? null) === ['originalNetworkTransId' => $original] && $original !== null,
+        charge_evidence($mitRow, $renewal) . ', network id ' . ($mitRow['network_transaction_id'] ?? '-'));
+
+    // 3. MIT, retry: the call Dunning::retry() makes after a declined attempt.
+    section('3. MIT resubmission (dunning retry): StoredCredential::resubmission()');
+    $retry = subscription_invoice($customer, $subscription, 'Sandbox COF retry', $amount());
+    attempt(fn () => $retry->pay(storedCredential: StoredCredential::resubmission()));
+    $resub = $wire->last();
+    $retryRow = charge_row($retry);
+    $check('3', 'resubmission MIT sent with the original id and reason, approved', $retryRow['status'] === 'succeeded'
+        && $resub['request']['processingOptions'] === ['isSubsequentAuth' => true]
+        && $resub['request']['subsequentAuthInformation'] === ['originalNetworkTransId' => $original, 'reason' => 'resubmission'],
+        charge_evidence($retryRow, $retry));
+
+    // 4. Later CIT with the saved card (the pay page's "saved card").
+    section('4. Later CIT: payWithSavedCard()');
+    $later = invoice_for($customer, 'Sandbox COF later CIT', $amount());
+    attempt(fn () => $later->payWithSavedCard(TEST_IP));
+    $cit = $wire->last();
+    $laterRow = charge_row($later);
+    $check('4', 'later CIT sent with isStoredCredentials only, approved', $laterRow['status'] === 'succeeded'
+        && $cit['request']['processingOptions'] === ['isStoredCredentials' => true] && !isset($cit['request']['subsequentAuthInformation'])
+        && $customer->refresh()->original_network_transaction_id === $original,
+        charge_evidence($laterRow, $later) . '; card keeps its original id');
+
+    // 5. No original id (a card saved before 0.1.2, or never charged): MIT flags without it.
+    section('5. MIT recurring with no original id on file');
+    $legacy = Customer::create(['email' => "sandbox+$run-cof-legacy@example.com", 'name' => 'Sandbox COF legacy']);
+    $legacy->updatePaymentMethod(sandbox_token('4111111111111111', '04', '2031', '123'));
+    $legacy = $legacy->refresh();
+    $noIdInvoice = invoice_for($legacy, 'Sandbox COF no original id', $amount());
+    attempt(fn () => $noIdInvoice->pay(storedCredential: StoredCredential::recurring()));
+    $noId = $wire->last();
+    $noIdRow = charge_row($noIdInvoice);
+    $healed = $legacy->refresh()->original_network_transaction_id;
+    $check('5', 'recurring MIT without an original id is approved, and its id becomes the card\'s', $noIdRow['status'] === 'succeeded'
+        && !isset($noId['request']['subsequentAuthInformation']) && isset($noId['request']['transactionSettings'])
+        && ($noId['request']['processingOptions'] ?? null) === ['isSubsequentAuth' => true]
+        && $healed !== null && $healed === $noIdRow['network_transaction_id'],
+        charge_evidence($noIdRow, $noIdInvoice) . ', card original id now ' . ($healed ?? 'NULL'));
+
+    // 6. One-time token, not saved: no card-on-file fields at all.
+    section('6. One-time token, card not saved');
+    $once = invoice_for($customer, 'Sandbox COF one-time', $amount());
+    attempt(fn () => $once->payWithToken(sandbox_token('4111111111111111', '03', '2031', '123'), false, TEST_IP));
+    $token = $wire->last();
+    $onceRow = charge_row($once);
+    $check('6', 'one-time token sent with no card-on-file fields', $onceRow['status'] === 'succeeded' && $onceRow['source'] === 'one_time_token'
+        && array_keys($token['request']) === ['transactionType'] && $customer->refresh()->original_network_transaction_id === $original,
+        charge_evidence($onceRow, $once) . ', network id ' . ($onceRow['network_transaction_id'] ?? '-'));
+
+    // 7. What Authorize.net recorded for each transaction (getTransactionDetails).
+    section('7. Authorize.net\'s side');
+    $auth = ['name' => example_env('AUTHORIZENET_LOGIN_ID'), 'transactionKey' => example_env('AUTHORIZENET_TRANSACTION_KEY')];
+    $recorded = [];
+    foreach (['first CIT' => $firstCharge?->gateway_transaction_id, 'recurring MIT' => $mitRow['gateway_transaction_id'], 'resubmission MIT' => $retryRow['gateway_transaction_id']] as $label => $tx) {
+        $t = $tx === null ? [] : (api('getTransactionDetailsRequest', ['merchantAuthentication' => $auth, 'transId' => $tx])['transaction'] ?? []);
+        $recorded[$label] = $t;
+        out(sprintf('    %-17s tx %s: networkTransId %s, originalNetworkTransId %s, recurringBilling %s', $label, $tx ?? '-', $t['networkTransId'] ?? '-',
+            $t['originalNetworkTransId'] ?? '-', json_encode($t['recurringBilling'] ?? null)));
+    }
+    $check('7', 'Authorize.net recorded the original id on both MITs, and the renewal as recurring',
+        ($recorded['recurring MIT']['originalNetworkTransId'] ?? null) === $original && ($recorded['recurring MIT']['recurringBilling'] ?? null) === true
+        && ($recorded['resubmission MIT']['originalNetworkTransId'] ?? null) === $original && ($recorded['first CIT']['networkTransId'] ?? null) === $original,
+        'getTransactionDetails, above');
+    $profile = api('getCustomerPaymentProfileRequest', ['merchantAuthentication' => $auth, 'customerProfileId' => $customer->gateway_customer_id,
+        'customerPaymentProfileId' => $customer->gateway_payment_id])['paymentProfile'] ?? [];
+    out(sprintf('    CIM payment profile %s: originalNetworkTransId %s, originalAuthAmount %s (Cleat stored %s)', $customer->gateway_payment_id,
+        $profile['originalNetworkTransId'] ?? '-', $profile['originalAuthAmount'] ?? '-', $original ?? 'NULL'));
+
+    $subscription?->cancelNow(); // leave nothing for a runner to renew
+
+    section('Card-on-file fields as sent, and what came back');
+    foreach ($wire->transactions as $i => $entry) {
+        out(sprintf('  %d. request %s', $i + 1, json_encode($entry['request'], JSON_UNESCAPED_SLASHES)));
+        out(sprintf('     response %s', json_encode($entry['response'], JSON_UNESCAPED_SLASHES)));
+    }
+
+    section('Summary');
+    $failed = 0;
+    foreach ($results as [$id, $name, $pass]) {
+        out(sprintf('  %-3s %-4s %s', $id, $pass ? 'PASS' : 'FAIL', $name));
+        $failed += $pass ? 0 : 1;
+    }
+    out($failed === 0 ? "\nAll checks passed." : "\n$failed check(s) failed.");
+    return $failed === 0 ? 0 : 1;
+}
+
+/** An open invoice on the subscription, as the runner makes for a renewal (own amount, so no duplicate filter). */
+function subscription_invoice(Customer $customer, ?Subscription $subscription, string $label, int $cents): Invoice
+{
+    $invoice = Invoice::createDraft($customer, ['subscription_id' => $subscription?->id, 'due_at' => Cleat::now()]);
+    $invoice->addLine($label, $cents);
+    $invoice->finalize();
+    out(sprintf('    invoice %s for %s on subscription %s', $invoice->number, money($cents), $subscription?->id ?? '-'));
+    return $invoice;
+}
+
 /** Recheck for the next day: refund settled charges (partial, then the rest). */
 function refund_settled(): int
 {
@@ -485,9 +633,9 @@ function browser_setup(): int
 function report(): int
 {
     $sections = [
-        'Customers' => 'SELECT id, email, gateway_customer_id AS profile, gateway_payment_id AS payment_profile, card_brand, card_last_four, card_exp FROM cleat_customers ORDER BY id DESC LIMIT 8',
+        'Customers' => 'SELECT id, email, gateway_customer_id AS profile, gateway_payment_id AS payment_profile, card_brand, card_last_four, card_exp, original_network_transaction_id AS original_nti FROM cleat_customers ORDER BY id DESC LIMIT 8',
         'Invoices' => 'SELECT id, number, status, total, amount_paid, subscription_id AS sub, payment_link_id AS link FROM cleat_invoices ORDER BY id DESC LIMIT 12',
-        'Charges' => 'SELECT c.id, i.number, c.status, c.amount, c.source, c.response_code AS resp, c.reason_code AS reason, c.gateway_transaction_id AS tx FROM cleat_charges c JOIN cleat_invoices i ON i.id = c.invoice_id ORDER BY c.id DESC LIMIT 12',
+        'Charges' => 'SELECT c.id, i.number, c.status, c.amount, c.source, c.response_code AS resp, c.reason_code AS reason, c.gateway_transaction_id AS tx, c.network_transaction_id AS nti FROM cleat_charges c JOIN cleat_invoices i ON i.id = c.invoice_id ORDER BY c.id DESC LIMIT 12',
         'Subscriptions' => 'SELECT id, customer_id, status, quantity, trial_ends_at, current_period_end FROM cleat_subscriptions ORDER BY id DESC LIMIT 5',
         'Refunds' => 'SELECT id, charge_id, method, status, amount, gateway_transaction_id AS tx, reason_code FROM cleat_refunds ORDER BY id DESC LIMIT 5',
         'Webhook events' => "SELECT gateway_event_id, event_type, JSON_UNQUOTE(JSON_EXTRACT(payload, '$.payload.id')) AS id, processed_at FROM cleat_webhook_events ORDER BY id DESC LIMIT 15",
@@ -826,6 +974,8 @@ final class RecordingGateway implements GatewayInterface
 {
     public bool $dropNextResponse = false;
     public ?string $droppedTransactionId = null;
+    /** @var list<?StoredCredential> what each chargeProfile call was given */
+    public array $credentials = [];
     /** @var list<array{call: string, result: GatewayResult}> */
     private array $calls = [];
     private int $mark = 0;
@@ -870,9 +1020,11 @@ final class RecordingGateway implements GatewayInterface
         return $this->record('deletePaymentProfile', "profile $profileId/$paymentProfileId", $this->inner->deletePaymentProfile($profileId, $paymentProfileId));
     }
 
-    public function chargeProfile(string $profileId, string $paymentProfileId, int $amountCents, string $invoiceNumber, string $idempotencyKey): GatewayResult
+    public function chargeProfile(string $profileId, string $paymentProfileId, int $amountCents, string $invoiceNumber, string $idempotencyKey, ?StoredCredential $storedCredential = null): GatewayResult
     {
-        return $this->transaction('chargeProfile', money($amountCents) . " $invoiceNumber", $this->inner->chargeProfile($profileId, $paymentProfileId, $amountCents, $invoiceNumber, $idempotencyKey));
+        $this->credentials[] = $storedCredential;
+        $what = money($amountCents) . " $invoiceNumber" . ($storedCredential !== null ? ' [' . $storedCredential->label() . ']' : '');
+        return $this->transaction('chargeProfile', $what, $this->inner->chargeProfile($profileId, $paymentProfileId, $amountCents, $invoiceNumber, $idempotencyKey, $storedCredential));
     }
 
     public function chargeToken(array $opaqueData, int $amountCents, string $invoiceNumber, string $idempotencyKey, ?string $email = null, ?string $ip = null): GatewayResult
@@ -928,6 +1080,59 @@ final class RecordingGateway implements GatewayInterface
     }
 }
 
+/**
+ * A cURL transport for AuthorizeNetGateway that keeps, from each
+ * createTransactionRequest, only its card-on-file fields (and the
+ * transaction type), and from each response only the codes and ids. Request
+ * bodies carry the transaction key and opaque card data; nothing else of
+ * them is kept or printed.
+ */
+final class CofWire
+{
+    private const REQUEST_FIELDS = ['transactionType', 'transactionSettings', 'processingOptions', 'subsequentAuthInformation'];
+    private const RESPONSE_FIELDS = ['responseCode', 'transId', 'networkTransId'];
+
+    /** @var list<array{request: array<string, mixed>, response: array<string, mixed>}> */
+    public array $transactions = [];
+
+    /** @return array{status: int, body: string, errno: int, error: string} */
+    public function send(string $url, string $body, int $timeout): array
+    {
+        $tx = json_decode($body, true)['createTransactionRequest']['transactionRequest'] ?? null;
+        $request = is_array($tx) ? array_intersect_key($tx, array_flip(self::REQUEST_FIELDS)) : null;
+        unset($tx);
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $body,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json'],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => min(10, $timeout),
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+        ]);
+        unset($body);
+        $response = curl_exec($ch);
+        $result = ['status' => (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE), 'body' => is_string($response) ? $response : '', 'errno' => curl_errno($ch), 'error' => curl_error($ch)];
+        curl_close($ch);
+
+        if ($request !== null) {
+            $tr = AuthorizeNetGateway::decode($result['body'])['transactionResponse'] ?? [];
+            $this->transactions[] = ['request' => $request, 'response' => array_intersect_key(is_array($tr) ? $tr : [], array_flip(self::RESPONSE_FIELDS))];
+            out(sprintf('      wire: request %s -> response %s', json_encode($request, JSON_UNESCAPED_SLASHES), json_encode(end($this->transactions)['response'], JSON_UNESCAPED_SLASHES)));
+        }
+        return $result;
+    }
+
+    /** @return array{request: array<string, mixed>, response: array<string, mixed>} */
+    public function last(): array
+    {
+        return end($this->transactions) ?: ['request' => [], 'response' => []];
+    }
+}
+
 // --- Dispatch ------------------------------------------------------------------
 
 $args = parse_args($argv);
@@ -945,6 +1150,7 @@ exit(match (true) {
     isset($args['refund-settled']) => refund_settled(),
     isset($args['profile-deleted']) => profile_deleted($recorder, is_string($args['profile-deleted']) ? (int) $args['profile-deleted'] : 900),
     isset($args['timeout-webhook']) => timeout_webhook($recorder, is_string($args['timeout-webhook']) ? (int) $args['timeout-webhook'] : 900),
+    isset($args['stored-credential']) => stored_credential(),
     isset($args['browser-setup']) => browser_setup(),
     isset($args['report']) => report(),
     default => run_checks($recorder, isset($args['held-amount']) ? to_cents((string) $args['held-amount']) : null),

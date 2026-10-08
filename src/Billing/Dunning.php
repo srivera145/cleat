@@ -13,6 +13,7 @@ use Cleat\Events\SubscriptionCanceled;
 use Cleat\Events\SubscriptionPastDue;
 use Cleat\Exceptions\ChargeInProgressException;
 use Cleat\Exceptions\PaymentFailedException;
+use Cleat\Gateway\StoredCredential;
 use Cleat\Invoice;
 use Cleat\Mail\Messages;
 use Cleat\Support\Db;
@@ -121,6 +122,10 @@ final class Dunning
     /**
      * A scheduled retry, called by the Runner after it has claimed the
      * invoice. Returns true when the invoice ended up paid.
+     *
+     * After a failed automatic attempt this is a resubmission. With no
+     * attempt yet, it is the runner picking up a renewal whose process died
+     * before charging (the lease), so it goes out as the renewal it is.
      */
     public static function retry(Invoice $invoice): bool
     {
@@ -130,8 +135,13 @@ final class Dunning
             Db::update('cleat_invoices', ['next_attempt_at' => null, 'updated_at' => Cleat::now()], ['id' => $invoice->id]);
             return false;
         }
+        $credential = match (true) {
+            $invoice->attempt_count > 0 => StoredCredential::resubmission(),
+            $subscription !== null => StoredCredential::recurring(),
+            default => StoredCredential::unscheduled(),
+        };
         try {
-            $invoice->pay();
+            $invoice->pay(storedCredential: $credential);
         } catch (PaymentFailedException) {
             return false;
         } catch (ChargeInProgressException $e) {

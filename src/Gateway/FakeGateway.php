@@ -24,6 +24,13 @@ use Cleat\Enums\GatewayStatus;
  * tok_decline declines every renewal. setPaymentProfileToken() changes it
  * mid-test. Transactions start unsettled; settle() settles them, which
  * matters for the refund-or-void decision.
+ *
+ * Approved and held charges return a network transaction id ("NTI..."), as
+ * Authorize.net does. Every charge call records the StoredCredential it was
+ * given under args['stored_credential'] (always null for chargeToken), so
+ * tests can assert the exact card-on-file indicators. Saving a card returns
+ * no original network transaction id, like the sandbox's testMode; set
+ * $liveValidation to return one, like a production liveMode validation.
  */
 final class FakeGateway implements GatewayInterface
 {
@@ -67,6 +74,12 @@ final class FakeGateway implements GatewayInterface
     /** When true, findTransaction() fails as if the gateway could not be reached. */
     public bool $failLookups = false;
 
+    /** When true, createPaymentProfile() returns an original network transaction id, as a liveMode validation does. */
+    public bool $liveValidation = false;
+
+    /** When false, charges come back without a network transaction id (a processor that sends none). */
+    public bool $returnNetworkTransIds = true;
+
     public function __construct(private readonly int $delayMs = 0)
     {
     }
@@ -95,6 +108,7 @@ final class FakeGateway implements GatewayInterface
             'card_brand' => $brand,
             'card_last_four' => $last4,
             'card_exp' => '2030-12',
+            'original_network_transaction_id' => $this->liveValidation ? self::newNetworkTransId() : null,
         ]);
     }
 
@@ -105,13 +119,14 @@ final class FakeGateway implements GatewayInterface
         return GatewayResult::ok();
     }
 
-    public function chargeProfile(string $profileId, string $paymentProfileId, int $amountCents, string $invoiceNumber, string $idempotencyKey): GatewayResult
+    public function chargeProfile(string $profileId, string $paymentProfileId, int $amountCents, string $invoiceNumber, string $idempotencyKey, ?StoredCredential $storedCredential = null): GatewayResult
     {
         $this->pause();
         $token = $this->profiles[$profileId]['payment_profiles'][$paymentProfileId] ?? null;
         $this->record(__FUNCTION__, [
             'profile_id' => $profileId, 'payment_profile_id' => $paymentProfileId, 'amount' => $amountCents,
             'invoice_number' => $invoiceNumber, 'idempotency_key' => $idempotencyKey, 'card' => $token === null ? null : $this->outcome($token),
+            'stored_credential' => $storedCredential,
         ]);
         if ($token === null) {
             // A profile from another process (or one the test never created) still charges
@@ -127,7 +142,7 @@ final class FakeGateway implements GatewayInterface
         $token = (string) $opaqueData['dataValue'];
         $this->record(__FUNCTION__, [
             'amount' => $amountCents, 'invoice_number' => $invoiceNumber, 'idempotency_key' => $idempotencyKey,
-            'email' => $email, 'ip' => $ip, 'card' => $this->outcome($token),
+            'email' => $email, 'ip' => $ip, 'card' => $this->outcome($token), 'stored_credential' => null,
         ]);
         return $this->authCapture($token, $amountCents, $invoiceNumber);
     }
@@ -256,10 +271,20 @@ final class FakeGateway implements GatewayInterface
             'insufficient' => $this->txResult(2, '2', 'insufficient funds'),
             'error' => $this->txResult(3, '19', 'An error occurred during processing. Please try again in 5 minutes.'),
             'held' => $this->txResult(4, '252', 'Your order has been received. Thank you for your business!',
-                $this->newTransaction($amountCents, $invoiceNumber, $last4, 'FDSPendingReview')),
+                $this->newTransaction($amountCents, $invoiceNumber, $last4, 'FDSPendingReview'), null, $this->networkTransIdForCharge()),
             default => $this->txResult(1, '1', 'This transaction has been approved.',
-                $this->newTransaction($amountCents, $invoiceNumber, $last4, 'capturedPendingSettlement'), 'XXXX' . $last4),
+                $this->newTransaction($amountCents, $invoiceNumber, $last4, 'capturedPendingSettlement'), 'XXXX' . $last4, $this->networkTransIdForCharge()),
         };
+    }
+
+    private function networkTransIdForCharge(): ?string
+    {
+        return $this->returnNetworkTransIds ? self::newNetworkTransId() : null;
+    }
+
+    private static function newNetworkTransId(): string
+    {
+        return 'NTI' . strtoupper(bin2hex(random_bytes(8)));
     }
 
     private function outcome(string $token): string
@@ -286,7 +311,7 @@ final class FakeGateway implements GatewayInterface
         return $id;
     }
 
-    private function txResult(int $code, string $reasonCode, string $reasonText, ?string $transactionId = null, ?string $accountNumber = null): GatewayResult
+    private function txResult(int $code, string $reasonCode, string $reasonText, ?string $transactionId = null, ?string $accountNumber = null, ?string $networkTransId = null): GatewayResult
     {
         $status = match ($code) {
             1 => GatewayStatus::Approved,
@@ -303,10 +328,13 @@ final class FakeGateway implements GatewayInterface
                 $code === 1 || $code === 4 ? 'description' : 'errorText' => $reasonText,
             ]],
         ], 'messages' => ['resultCode' => $code === 1 ? 'Ok' : 'Error'], 'fake' => true];
+        if ($networkTransId !== null) {
+            $raw['transactionResponse']['networkTransId'] = $networkTransId;
+        }
 
         return new GatewayResult($code === 1, $status, $transactionId, $code, $reasonCode, $reasonText, $raw, [
             'account_number' => $accountNumber,
-        ]);
+        ], $networkTransId);
     }
 
     /** @param array<string, mixed> $args */

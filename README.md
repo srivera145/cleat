@@ -50,10 +50,12 @@ Until a Connect driver ships, anything given a connected account throws
 16. [Templates](#templates)
 17. [Security model](#security-model)
 18. [How charging stays safe](#how-charging-stays-safe)
-19. [Connect (stub)](#connect-stub)
-20. [Testing](#testing)
-21. [Schema notes](#schema-notes)
-22. [Verified against the Authorize.net sandbox](#verified-against-the-authorizenet-sandbox)
+19. [Stored credentials (card on file)](#stored-credentials-card-on-file)
+20. [Connect (stub)](#connect-stub)
+21. [Testing](#testing)
+22. [Schema notes](#schema-notes)
+23. [Upgrading](#upgrading)
+24. [Verified against the Authorize.net sandbox](#verified-against-the-authorizenet-sandbox)
 
 ---
 
@@ -73,11 +75,12 @@ No other runtime dependencies.
 composer require echodial/cleat
 ```
 
-Run the migration with your own migration tool. It is plain SQL and safe to
-run twice:
+Run the migrations, in order, with your own migration tool. They are plain
+SQL and safe to run twice:
 
 ```bash
 mysql your_db < vendor/echodial/cleat/database/migrations/001_create_cleat_tables.sql
+mysql your_db < vendor/echodial/cleat/database/migrations/002_stored_credentials.sql
 ```
 
 Or from PHP: `Cleat\Support\Schema::migrate($pdo);`
@@ -585,6 +588,58 @@ Cleat refuses to charge while a database transaction is open on its
 connection, because a host transaction would keep the pending row from being
 committed first. Don't wrap Cleat payment calls in your own transaction.
 
+It also refuses to save or charge a card until every migration has run, so a
+missing migration fails before money moves, not while a payment is recorded.
+
+## Stored credentials (card on file)
+
+Card networks expect a stored card's transactions to say who started them.
+The first one is customer-initiated (CIT) and establishes the stored
+credential. Later charges Cleat makes on its own are merchant-initiated (MIT)
+and carry the network transaction ID of that first transaction. Cleat sends
+these indicators on every charge of a saved card:
+
+| Charge | Sent as | Authorize.net fields |
+| --- | --- | --- |
+| New subscription's first payment: `newSubscription()->create()`, or a checkout for a recurring price | first CIT, recurring | `processingOptions.isFirstRecurringPayment` |
+| Pay page, "save this card" | first CIT; recurring on a subscription's invoice | `isFirstRecurringPayment`, otherwise `isFirstSubsequentAuth` (sandbox) or `isStoredCredentials` (production; see below) |
+| Pay page, saved card | CIT with a stored card | `processingOptions.isStoredCredentials` |
+| Renewal or trial conversion (runner) | MIT, recurring | `transactionSettings` `recurringBilling=true`, `processingOptions.isSubsequentAuth`, `subsequentAuthInformation.originalNetworkTransId` |
+| Dunning retry | MIT, resubmission | `isSubsequentAuth`, `originalNetworkTransId`, `reason=resubmission` |
+| `$customer->charge()`, `invoiceFor()`, `swap()`, `$invoice->pay()` | MIT, unscheduled | `isSubsequentAuth`, `originalNetworkTransId` |
+| One-time card, not saved (checkout for a one-time price, pay page with save off) | nothing: not a stored credential | none |
+
+`$invoice->pay()` defaults to an unscheduled MIT. When your app charges a
+saved card while the customer is present, say so:
+
+```php
+use Cleat\Gateway\StoredCredential;
+
+$invoice->pay(storedCredential: StoredCredential::customerInitiated());
+```
+
+**The original network transaction ID.** Every charge's ID is kept in
+`cleat_charges.network_transaction_id`. The saved card's original ID is kept
+in `cleat_customers.original_network_transaction_id` and sent with every MIT.
+It comes from the first approved stored-credential charge on the card. In
+production it is already known when the card is saved: CIM's `liveMode`
+validation is the card's first stored-credential transaction, and Cleat reads
+its ID from the payment profile. That is also why, in production, a "save
+this card" charge on a one-off invoice is sent with `isStoredCredentials`
+rather than `isFirstSubsequentAuth`, as Authorize.net's card-on-file guide
+asks. A new card starts with its own ID, never the old card's.
+
+**When the ID is missing.** Cards saved before 0.1.2 have no original ID on
+file, and neither does a card saved in the sandbox (`testMode`) that has not
+been charged yet, such as one saved for a trial. Cleat sends the MIT flags
+without the ID rather than failing (CIM then sends the ID stored with the
+payment profile, if it has one) and logs one notice per customer at `info`
+level. The first approved charge's ID then becomes the card's, so the notice
+stops by itself.
+
+`originalAuthAmount` is never sent: CIM stores it with the payment profile and
+sends it itself.
+
 ## Connect (stub)
 
 `Connect\ConnectGatewayInterface` defines `createAccount`, `onboardingUrl`,
@@ -619,6 +674,13 @@ php -S localhost:8080 -t examples/public examples/public/router.php
 `FakeGateway` decides outcomes by token: `tok_decline`, `tok_insufficient`,
 `tok_error`, `tok_held`, `tok_timeout`, `tok_timeout_captured`, `tok_invalid`; anything else approves
 (`tok_visa`, `tok_mastercard`, `tok_amex`, `tok_discover` pick a brand).
+Approved and held charges return a network transaction ID. Each call is
+recorded in `$gateway->calls`, with the `StoredCredential` a charge was given
+under `args['stored_credential']`, so a test can assert the exact
+card-on-file indicators. Set `$gateway->liveValidation = true` to make saving
+a card return an original network transaction ID, as production's `liveMode`
+validation does, and `$gateway->returnNetworkTransIds = false` for a processor
+that returns none.
 
 ## Schema notes
 
@@ -637,15 +699,41 @@ with four small additions:
 All amounts are `BIGINT` cents. All timestamps are `DATETIME` written in UTC,
 so the connection's time zone can never shift them.
 
+`database/migrations/002_stored_credentials.sql` (0.1.2) adds two nullable
+`VARCHAR(255)` columns, `cleat_customers.original_network_transaction_id` and
+`cleat_charges.network_transaction_id` (see
+[Stored credentials](#stored-credentials-card-on-file)).
+
+## Upgrading
+
+### 0.1.1 to 0.1.2
+
+1. **Run `002_stored_credentials.sql`** (or `Schema::migrate($pdo)`). It only
+   adds two nullable columns at the end of their tables, which MySQL 8 and
+   MariaDB 10.11 do instantly, without rebuilding or locking the table, so it
+   is safe on a live database. It is safe to run twice. Until it has run,
+   Cleat throws a `CleatException` before saving or charging a card.
+2. **Custom gateways only:** `GatewayInterface::chargeProfile()` has a new last
+   parameter, `?StoredCredential $storedCredential = null`. Add it to your
+   implementation, and send the indicators it describes.
+   `GatewayResult` has a new `networkTransactionId` property, and
+   `createPaymentProfile()` may return `original_network_transaction_id`.
+3. Nothing else changes. Cards saved before 0.1.2 keep working. Their first
+   merchant-initiated charge goes out without an original network transaction
+   ID, with one notice in your log, and the ID that charge returns is kept
+   for the next ones.
+
 ## Verified against the Authorize.net sandbox
 
 Version 0.1.1 was run end to end against a live Authorize.net sandbox:
 CIM profiles from real Accept.js tokens, approvals, declines, errors and
 fraud holds (approved and declined), the refund → error 54 → void fallback,
 `findTransaction` timeout recovery, signed webhooks, and the hosted checkout
-and invoice pages in Chrome under Cleat's CSP. [SANDBOX.md](SANDBOX.md) has
-the results, the test triggers that work, and how to repeat the pass with
-`examples/sandbox-check.php`.
+and invoice pages in Chrome under Cleat's CSP. Version 0.1.2 added the
+stored-credential indicators: every kind of charge was sent to the sandbox,
+approved, and checked in Authorize.net's transaction records.
+[SANDBOX.md](SANDBOX.md) has the results, the test triggers that work, and
+how to repeat the pass with `examples/sandbox-check.php`.
 
 Still unverified, and worth checking before the first live charge:
 
@@ -655,8 +743,13 @@ Still unverified, and worth checking before the first live charge:
   webhook remains the backstop for anything older. Configure webhooks.
 - Production endpoints (`api.authorize.net`, `js.authorize.net`) and live
   card networks. The sandbox never reaches a processor.
-- Stored-credential (card-on-file) indicators on recurring charges, which
-  can improve approval rates. Cleat does not send them yet.
+- How a processor treats the stored-credential indicators. Version 0.1.2
+  checked in the sandbox that every kind is accepted and approved and that
+  Authorize.net records the original network transaction ID and
+  `recurringBilling` (`php examples/sandbox-check.php --stored-credential`).
+  The sandbox does not validate the indicators or pass them to a network,
+  and the `liveMode` validation that provides a card's ID at save time only
+  happens in production.
 
 MySQL 8 is covered by the CI workflow in `.github/workflows/ci.yml`;
 locally the suite has run on MariaDB 10.11 in MySQL 8 strict mode.

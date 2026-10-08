@@ -8,6 +8,7 @@ use Cleat\Billing\Period;
 use Cleat\Enums\SubscriptionStatus;
 use Cleat\Events\SubscriptionCreated;
 use Cleat\Exceptions\PaymentFailedException;
+use Cleat\Gateway\StoredCredential;
 use Cleat\Support\Db;
 use InvalidArgumentException;
 
@@ -119,8 +120,10 @@ final class SubscriptionBuilder
             return [$subscription, $invoice->refresh()];
         });
 
+        // The customer is subscribing: a customer-initiated charge that starts
+        // the recurring series (and, with a card just saved, the card's use).
         try {
-            $invoice->pay();
+            $invoice->pay(storedCredential: StoredCredential::firstCustomerInitiated(recurring: true));
         } catch (PaymentFailedException $e) {
             Cleat::events()->dispatch(new SubscriptionCreated($subscription->refresh()));
             throw $e;

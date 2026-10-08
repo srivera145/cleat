@@ -165,6 +165,88 @@ bootstrap.
   example app has no `favicon.ico`, so browsers log a 404. Neither comes from
   Cleat.
 
+## Stored credentials (0.1.2)
+
+Cleat 0.1.2 sends card-on-file indicators on every charge of a saved card.
+They were checked against the same sandbox account on 2026-10-07 and 08 with
+`php examples/sandbox-check.php --stored-credential`. The script captures each
+request on the wire and keeps only its card-on-file fields, and keeps only
+the codes and IDs of each response. Afterwards it asks Authorize.net what it
+recorded (`getTransactionDetailsRequest`).
+
+Results of the final run (run 002213, 2026-10-08 00:22 UTC): 7 of 7 pass.
+The request column is the card-on-file part of each request, exactly as
+sent. Every charge row stored the `networkTransId` it got back.
+
+| Check | Request (card-on-file fields) | Response | Result |
+|---|---|---|---|
+| 1. First CIT: `newSubscription()->create($card)` | `processingOptions.isFirstRecurringPayment: true` | 1, tx 80060647671, `networkTransId` XKUQ600PGWLL9PUPD7SCZUV | Pass: charge 47 and customer 18's `original_network_transaction_id` hold that ID |
+| 2. MIT recurring (`Runner::charge()`'s call) | `transactionSettings` `recurringBilling=true`, `processingOptions.isSubsequentAuth: true`, `subsequentAuthInformation.originalNetworkTransId` XKUQ600PGWLL9PUPD7SCZUV | 1, tx 80060647672, `networkTransId` B7ELVCYQRYK6ZLIF02KAPA4 | Pass |
+| 3. MIT resubmission (`Dunning::retry()`'s call) | `isSubsequentAuth: true`, `originalNetworkTransId` XKUQ600PGWLL9PUPD7SCZUV, `reason: resubmission` | 1, tx 80060647674, `networkTransId` 5STJ8W1R6XRAHO12WVEAFEQ | Pass |
+| 4. Later CIT: `payWithSavedCard()` | `isStoredCredentials: true` | 1, tx 80060647676 | Pass: the card keeps its original ID |
+| 5. MIT recurring, no original ID on file | `recurringBilling=true`, `isSubsequentAuth: true`, no `subsequentAuthInformation` | 1, tx 80060647680, `networkTransId` 1NX81SITUL46LG9UOCWRPRU | Pass: approved; one `info` notice for customer 19; that ID became the card's original ID |
+| 6. One-time token, not saved | none | 1, tx 80060647682, `networkTransId` K44IDTWPPIJC7S244G9112P | Pass: stored on charge 52 only |
+| 7. What Authorize.net recorded | | 80060647672: `originalNetworkTransId` XKUQ600PGWLL9PUPD7SCZUV, `recurringBilling` true; 80060647674: `originalNetworkTransId` XKUQ600PGWLL9PUPD7SCZUV | Pass |
+
+An earlier run (231724), made before the recurring MIT gained
+`isSubsequentAuth`, passed checks 1 to 6 the same way (first CIT 80060645184,
+recurring MIT 80060645185, resubmission 80060645186). It is how the gap
+described next was found.
+
+### How a recurring MIT is sent
+
+Authorize.net's [card-on-file guide](https://developer.authorize.net/api/reference/features/card-on-file.html)
+shows a recurring merchant-initiated charge as `transactionSettings`
+`recurringBilling=true` plus `subsequentAuthInformation.originalNetworkTransId`,
+with no `processingOptions`. The sandbox records that form without the
+original ID. Three renewals of the same card, each sent with the original ID
+8177XDZDCSIYEXH16VYNABE (from first CIT 80060645184), were read back with
+`getTransactionDetailsRequest`:
+
+| Sent | Transaction | Recorded `recurringBilling` | Recorded `originalNetworkTransId` |
+|---|---|---|---|
+| `recurringBilling` + ID (the guide) | 80060645233 | true | **none** |
+| `isSubsequentAuth` + ID | 80060645240 | false | 8177XDZDCSIYEXH16VYNABE |
+| `recurringBilling` + `isSubsequentAuth` + ID | 80060645243 | true | 8177XDZDCSIYEXH16VYNABE |
+
+Cleat sends the third form, which is the only one where the record keeps
+both. It also matches Authorize.net's newer knowledge-base articles
+(KA-10435, 000002704), which pair `isSubsequentAuth` with the MIT fields. The
+sandbox validates none of these fields and never reaches a processor, so this
+shows what Authorize.net records, not what a network receives.
+
+### Migration 002 on this live 0.1.1 database
+
+`cleat_sandbox` held the data of the 0.1.1 pass: 13 customers, 35 invoices,
+34 charges, 1 subscription, 2 refunds and 28 webhook events.
+`mariadb cleat_sandbox < database/migrations/002_stored_credentials.sql` was
+run twice. Both runs exited 0, and the second changed nothing. Every table's
+row count and a CRC32 checksum over every row's existing columns were the
+same before and after. On MariaDB 10.11.18, MySQL 8.0.40 and MySQL 8.4.3, a
+fresh 0.1.1 schema accepted both of 002's `ADD COLUMN`s with
+`ALGORITHM=INSTANT`, so they are metadata-only changes.
+
+### Worth knowing
+
+- **Every approved transaction returns `networkTransId`**, one-time tokens
+  included, as a 23-character alphanumeric string. Held transactions return
+  none.
+- **CIM in the sandbox keeps no original ID** on the payment profile:
+  `getCustomerPaymentProfileRequest` showed no `originalNetworkTransId`, even
+  after the first charge. Cards are saved in `testMode` here; production's
+  `liveMode` validation is what the guide says provides it.
+- **`getTransactionDetails` shows `originalNetworkTransId` only when
+  `isSubsequentAuth` was sent** (see the table above).
+- **The Transaction IP Velocity Filter holds charges.** A second run
+  started two minutes after the first, with a test of the three forms in
+  between. Three of its charges, 80060645281, 80060645282 and 80060645285,
+  came back with response 4 and reason 252. `FDSFilters` named "Transaction
+  IP Velocity Filter", which counts transactions per hour from the API
+  caller's IP. The one-time token in the same run passed because it carries
+  `customerIP`. That run is not part of the results. Its held transactions
+  were left in review, and their charges are `held` in `cleat_sandbox`. Leave
+  an hour between runs.
+
 ## Not verified
 
 These are open items, not passes:
@@ -188,8 +270,12 @@ These are open items, not passes:
   networks. The sandbox never reaches a processor.
 - **Browsers other than Chrome**, and real mobile devices. The 375px pass was
   Chrome's device emulation.
-- **Stored-credential (card-on-file) indicators** on recurring charges. Cleat
-  does not send them yet.
+- **Stored-credential indicators at a processor.** The sandbox accepts and
+  records them but does not validate them. The `liveMode` validation that
+  gives a card its original ID at save time, and the processors Authorize.net
+  supports COF on, are production only. The runner's own renewal and the
+  dunning schedule were not run live; `--stored-credential` makes the same
+  `pay()` calls they make.
 
 ## Repeating the pass
 
@@ -206,7 +292,9 @@ These are open items, not passes:
 5. In the merchant interface, set up the FDS Amount Filter described under
    Sandbox triggers.
 6. `php examples/sandbox-check.php --held-amount=600.00`, then `--timeout-webhook`
-   and `--profile-deleted`.
+   and `--profile-deleted`. `--stored-credential` checks the card-on-file
+   indicators; give it an hour after other runs (Transaction IP Velocity
+   Filter).
 7. `php examples/sandbox-check.php --browser-setup` prints the checkout links and
    three fresh invoices for the browser flows. Afterwards, `--report` shows what
    Cleat recorded.

@@ -10,6 +10,7 @@ use Cleat\Enums\SubscriptionStatus;
 use Cleat\Events\SubscriptionCanceled;
 use Cleat\Exceptions\ChargeInProgressException;
 use Cleat\Exceptions\PaymentFailedException;
+use Cleat\Gateway\StoredCredential;
 use Cleat\Invoice;
 use Cleat\Security\RateLimiter;
 use Cleat\Subscription;
@@ -203,10 +204,11 @@ final class Runner
         });
     }
 
+    /** A renewal or trial conversion: a merchant-initiated recurring charge. */
     private function charge(Invoice $invoice, RunReport $report): void
     {
         try {
-            $invoice->pay();
+            $invoice->pay(storedCredential: StoredCredential::recurring());
             $report->paymentsSucceeded++;
         } catch (PaymentFailedException) {
             $report->paymentsFailed++;
