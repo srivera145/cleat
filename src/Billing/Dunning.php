@@ -106,7 +106,7 @@ final class Dunning
             Db::update('cleat_invoices', ['status' => InvoiceStatus::Uncollectible, 'next_attempt_at' => null, 'updated_at' => $now], ['id' => $invoice->id]);
             $fields = ['status' => $finalAction, 'updated_at' => $now];
             if ($finalAction === SubscriptionStatus::Canceled) {
-                $fields += ['canceled_at' => $now, 'ends_at' => $now];
+                $fields += ['canceled_at' => $now, 'ends_at' => $now, 'scheduled_price_id' => null];
             }
             Db::update('cleat_subscriptions', $fields, ['id' => $subscription->id]);
         });
@@ -117,6 +117,9 @@ final class Dunning
         Cleat::events()->dispatch($finalAction === SubscriptionStatus::Canceled
             ? new SubscriptionCanceled($subscription)
             : new SubscriptionPastDue($subscription, $invoice));
+        if ($finalAction === SubscriptionStatus::Canceled && (bool) Cleat::config('emails.subscription_canceled')) {
+            Messages::subscriptionCanceled($subscription, $invoice->customer(), immediately: true);
+        }
     }
 
     /**

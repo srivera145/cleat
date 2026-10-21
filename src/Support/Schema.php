@@ -33,12 +33,13 @@ final class Schema
         $found = (int) $pdo->query(
             "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND (
                 (table_name = 'cleat_customers' AND column_name = 'original_network_transaction_id')
-                OR (table_name = 'cleat_charges' AND column_name = 'network_transaction_id'))",
+                OR (table_name = 'cleat_charges' AND column_name = 'network_transaction_id')
+                OR (table_name = 'cleat_subscriptions' AND column_name IN ('scheduled_price_id', 'trial_ending_notified_at')))",
         )->fetchColumn();
-        if ($found !== 2) {
+        if ($found !== 4) {
             throw new CleatException(
-                'The Cleat database is not up to date: run database/migrations/002_stored_credentials.sql '
-                . '(additive and safe on a live database), or Schema::migrate($pdo).'
+                'The Cleat database is not up to date: run database/migrations/002_stored_credentials.sql and '
+                . '003_period_end_changes.sql (both additive and safe on a live database), or Schema::migrate($pdo).'
             );
         }
         self::$migrated[$key] = true;

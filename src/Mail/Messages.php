@@ -15,9 +15,10 @@ use DateTimeImmutable;
 use Throwable;
 
 /**
- * Composes and sends Cleat's three emails, each as HTML (from the template)
- * plus a plain-text part. A mailer failure is logged and never undoes the
- * billing work that triggered the email.
+ * Composes and sends Cleat's emails (invoice, payment failed, receipt and
+ * trial started, trial ending, subscription canceled), each as HTML (from the
+ * template) plus a plain-text part. A mailer failure is logged and never
+ * undoes the billing work that triggered the email.
  */
 final class Messages
 {
@@ -95,6 +96,61 @@ final class Messages
         $text = implode("\n", [
             sprintf('Your free trial of %s has started. Nothing has been charged.', $price->label()),
             sprintf('It ends on %s, then %s.', $subscription->trial_ends_at?->format('M j, Y') ?? '', $price->display($subscription->quantity)),
+            ...self::supportLines(),
+        ]);
+        self::send($customer->email, $subject, $html, $text);
+    }
+
+    /** A trial converts to a paid period soon (trial_ending_days before it ends). */
+    public static function trialEnding(Subscription $subscription, Customer $customer): void
+    {
+        $price = $subscription->price();
+        $endsOn = $subscription->trial_ends_at?->format('M j, Y') ?? '';
+        $subject = sprintf('Your %s trial ends on %s', $price->product()->name, $endsOn);
+        $html = View::render('emails/trial_ending', [
+            'subscription' => $subscription,
+            'price' => $price,
+            'customer' => $customer,
+            'brand' => Cleat::config('brand'),
+            'brandName' => self::brandName(),
+            'buttonColor' => self::buttonColor(),
+            'cardLabel' => $customer->paymentMethodLabel(),
+        ]);
+        $text = implode("\n", [
+            sprintf('Your free trial of %s ends on %s.', $price->label(), $endsOn),
+            sprintf('Then %s.', $price->display($subscription->quantity)),
+            $customer->paymentMethodLabel() !== null
+                ? sprintf('We will charge your %s.', $customer->paymentMethodLabel())
+                : 'There is no card on file yet: add one to keep your plan.',
+            "Cancel before the trial ends and you won't be charged.",
+            ...self::supportLines(),
+        ]);
+        self::send($customer->email, $subject, $html, $text);
+    }
+
+    /**
+     * A subscription was canceled: at the end of its period (it keeps working
+     * until then and can be resumed), or right away.
+     */
+    public static function subscriptionCanceled(Subscription $subscription, Customer $customer, bool $immediately): void
+    {
+        $price = $subscription->price();
+        $endsOn = ($subscription->ends_at ?? $subscription->current_period_end)->format('M j, Y');
+        $subject = sprintf('Your %s subscription is canceled', $price->product()->name);
+        $html = View::render('emails/subscription_canceled', [
+            'subscription' => $subscription,
+            'price' => $price,
+            'customer' => $customer,
+            'brand' => Cleat::config('brand'),
+            'brandName' => self::brandName(),
+            'buttonColor' => self::buttonColor(),
+            'immediately' => $immediately,
+        ]);
+        $text = implode("\n", [
+            $immediately
+                ? sprintf("Your subscription to %s ended on %s. You won't be charged again.", $price->label(), $endsOn)
+                : sprintf("Your subscription to %s stays active until %s, and you won't be charged again.", $price->label(), $endsOn),
+            ...($immediately ? [] : ['You can reactivate it any time before then.']),
             ...self::supportLines(),
         ]);
         self::send($customer->email, $subject, $html, $text);

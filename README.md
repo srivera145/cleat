@@ -117,6 +117,8 @@ Cleat::configure($pdo, $config, new MyMailer()); // mailer optional; see Email
 | `rate_limits` | see file | `per_ip`, `per_link`, `failures_per_ip` as `[max, window seconds]`. |
 | `automation` | see [Dunning](#dunning) | Retry schedule and what happens after it. |
 | `grace_days` | `0` | Days a `past_due` subscription still counts as `active()`. |
+| `trial_ending_days` | `3` | The Runner sends the trial-ending notice this many days before a trial converts (1-30). `null` = none. |
+| `emails` | both `true` | `trial_ending` and `subscription_canceled`: turn either email off. The events fire either way. |
 | `deck_css` | jsDelivr `@echodial/deck@0.1` | Or a path on your own site. The CSP follows this origin. |
 | `templates_path` | `null` | A folder checked before the package's templates (see [Templates](#templates)). |
 
@@ -220,7 +222,18 @@ $subscription->resume();        // only before ends_at
 $subscription->cancelNow();     // immediately, no refund; stops pending retries
 $subscription->swap('premium-yearly');               // prorated
 $subscription->swap('basic-monthly', prorate: false);
+$subscription->swapAtPeriodEnd('basic-monthly');     // at the end of the period or trial (0.1.3)
+$subscription->cancelScheduledSwap();
 ```
+
+**Changes at period end** (0.1.3) are the usual way to downgrade: nothing is
+charged or credited now, and the customer keeps what they paid for until the
+period (or trial) ends. The Runner applies the change as it rolls the period,
+so the renewal invoice is for the new price and the new period follows the new
+price's interval (yearly to monthly renews a month later). `scheduledPrice()`
+says what is coming. Asking for the current price clears it, a later call
+replaces it, and an immediate `swap()`, `cancel()` or `cancelNow()` drops it.
+A subscription set to cancel must be resumed before it can schedule a change.
 
 **Proration** uses the seconds left in the current period. The unused part of
 the old price becomes a credit line and the rest of the period at the new
@@ -365,11 +378,13 @@ is logged; the rest still ran), 2 means bad usage.
 
 Each run, in order:
 
+0. Trials ending within `trial_ending_days` (and not set to cancel): fire
+   `TrialEnding` and send the trial-ending email, once per subscription.
 1. Trials ending now or earlier: invoice the first paid period and charge it.
    No card on file takes the past-due path, with a pay-link email.
 2. Active subscriptions whose period has ended (and are not set to cancel):
-   roll the period, create the renewal invoice (with any pending proration
-   lines), charge it.
+   roll the period, applying any change scheduled with `swapAtPeriodEnd()`,
+   create the renewal invoice (with any pending proration lines), charge it.
 3. Subscriptions set to cancel whose `ends_at` has passed: mark them canceled.
 4. Open invoices with a retry due: retry through dunning.
 5. Deactivate expired payment links and prune rate-limit rows older than 24 hours.
@@ -457,8 +472,9 @@ Cleat::events()->listen('*', fn (object $event) => $keelEvents->dispatch($event)
 ```
 
 `PaymentSucceeded`, `PaymentFailed`, `SubscriptionCreated`,
-`SubscriptionCanceled`, `SubscriptionPastDue`, `InvoiceCreated`,
-`InvoiceSent`, `InvoicePaid`, `CheckoutCompleted`, and `ChargeRefunded`.
+`SubscriptionCanceled`, `SubscriptionPastDue`, `TrialEnding` (0.1.3),
+`InvoiceCreated`, `InvoiceSent`, `InvoicePaid`, `CheckoutCompleted`, and
+`ChargeRefunded`.
 
 Events fire after the database work they describe has committed; an event
 raised in a transaction that rolls back is dropped. By default a listener that
@@ -467,9 +483,14 @@ throws is logged and skipped, because by then money has moved. Call
 
 ## Email
 
-Cleat sends three emails: the invoice (with a "Pay invoice" button), payment
-failed (with the pay link), and the receipt (also used for "your trial has
-started"). Each comes as HTML plus plain text, through any mailer you wrap:
+Cleat sends five emails: the invoice (with a "Pay invoice" button), payment
+failed (with the pay link), the receipt (also used for "your trial has
+started"), and since 0.1.3 the trial-ending notice (`trial_ending_days` before
+a trial converts) and subscription canceled (when `cancel()` schedules the
+end, saying until when it keeps working; when `cancelNow()` or the last failed
+dunning retry ends it). The Runner's own period-end cancellation sends nothing:
+the customer already has the date. Each comes as HTML plus plain text, through
+any mailer you wrap:
 
 ```php
 use Cleat\Mail\MailerInterface;
@@ -704,7 +725,26 @@ so the connection's time zone can never shift them.
 `cleat_charges.network_transaction_id` (see
 [Stored credentials](#stored-credentials-card-on-file)).
 
+`database/migrations/003_period_end_changes.sql` (0.1.3) adds two nullable
+columns to `cleat_subscriptions`: `scheduled_price_id` (the price
+`swapAtPeriodEnd()` scheduled) and `trial_ending_notified_at` (so the notice
+goes out once).
+
 ## Upgrading
+
+### 0.1.2 to 0.1.3
+
+1. **Run `003_period_end_changes.sql`** (or `Schema::migrate($pdo)`). Like 002
+   it only adds two nullable columns at the end of a table, an instant change
+   on MySQL 8 and MariaDB 10.11, and it is safe to run twice. Until it has
+   run, Cleat throws a `CleatException` before saving or charging a card.
+2. **Two new emails go out by default**: the trial-ending notice and
+   subscription canceled. Set `emails.trial_ending` / `emails.subscription_canceled`
+   to `false` (or `trial_ending_days` to `null`) to keep 0.1.2's behaviour.
+   Hosts overriding templates can add `emails/trial_ending.php` and
+   `emails/subscription_canceled.php` to their `templates_path`.
+3. Nothing else changes. `swap()` still swaps immediately; it now also clears
+   a change scheduled with `swapAtPeriodEnd()`.
 
 ### 0.1.1 to 0.1.2
 

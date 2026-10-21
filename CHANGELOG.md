@@ -4,6 +4,37 @@ All notable changes to Cleat are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Cleat uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - Unreleased
+
+Price changes at the end of a period, and the trial-ending and
+subscription-canceled emails. Run `database/migrations/003_period_end_changes.sql`
+when upgrading; see "Upgrading" in the README. Made for Bearing Cloud
+(downgrades at period end, and the lifecycle emails its plans need).
+
+### Added
+
+- `Subscription::swapAtPeriodEnd($lookupKey)`: move to another price when the
+  current period or trial ends, with no proration and nothing charged now.
+  The Runner applies it as it rolls the period; the new period follows the
+  new price's interval. `scheduledPrice()` and `cancelScheduledSwap()`.
+- The trial-ending notice: the Runner fires `TrialEnding` and sends the
+  `trial_ending` email `trial_ending_days` (default 3) before a trial
+  converts, once per subscription, never for a trial set to cancel.
+- The `subscription_canceled` email, on `cancel()` (stays active until the
+  period end, and can be reactivated), `cancelNow()` and a final dunning
+  cancel. Not for a subscription that never started.
+- Config: `trial_ending_days` (1-30 or `null`) and `emails.trial_ending` /
+  `emails.subscription_canceled`.
+- Migration 003: `cleat_subscriptions.scheduled_price_id` and
+  `trial_ending_notified_at`, both nullable, additive and safe to run twice.
+
+### Changed
+
+- `swap()`, `cancel()`, `cancelNow()` and a final dunning cancel clear a
+  scheduled price change.
+- `Schema::assertMigrated()` also requires migration 003.
+- `RunReport` has `trialEndingNotices`.
+
 ## [0.1.2] - 2026-10-07
 
 Stored-credential (card-on-file) indicators on every charge of a saved card.

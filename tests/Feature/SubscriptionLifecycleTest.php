@@ -33,9 +33,10 @@ final class SubscriptionLifecycleTest extends TestCase
         $this->assertSame(0, $this->gateway->chargeCount(), 'no charge during a trial');
         $this->assertCount(1, $this->eventsOf(SubscriptionCreated::class));
 
-        // Day 6: nothing happens.
+        // Day 6: nothing is charged; the trial-ending notice goes out (trial_ending_days = 3).
         $report = $this->runAt('2026-03-07 09:00:00');
         $this->assertSame(0, $report->trialsConverted);
+        $this->assertSame(1, $report->trialEndingNotices);
         $this->assertSame(0, $this->gateway->chargeCount());
 
         // Day 7: converted, charged, active, new period.
@@ -58,7 +59,11 @@ final class SubscriptionLifecycleTest extends TestCase
         $this->assertSame(1, $this->gateway->chargeCount());
         $this->assertCount(1, $this->eventsOf(PaymentSucceeded::class));
         $this->assertCount(1, $this->eventsOf(InvoicePaid::class));
-        $this->assertCount(1, $this->mailer->to('jane@example.com'), 'receipt email');
+        $this->assertSame(
+            ['Your Premium trial ends on Mar 8, 2026', 'Receipt from Acme Tools, invoice CLT-000001'],
+            array_column($this->mailer->to('jane@example.com'), 'subject'),
+            'the trial-ending notice, then the receipt',
+        );
     }
 
     /** Self-check 4: a monthly subscription started Jan 31 renews Feb 28 (29 in a leap year), then Mar 31. */

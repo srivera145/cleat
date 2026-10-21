@@ -11,6 +11,7 @@ use Cleat\Events\SubscriptionCanceled;
 use Cleat\Exceptions\CleatException;
 use Cleat\Exceptions\NotFoundException;
 use Cleat\Exceptions\PaymentFailedException;
+use Cleat\Mail\Messages;
 use Cleat\Support\Db;
 use DateTimeImmutable;
 use InvalidArgumentException;
@@ -34,6 +35,8 @@ final class Subscription
         public readonly ?string $application_fee_percent,
         public readonly DateTimeImmutable $created_at,
         public DateTimeImmutable $updated_at,
+        public ?int $scheduled_price_id = null,
+        public ?DateTimeImmutable $trial_ending_notified_at = null,
     ) {
     }
 
@@ -51,6 +54,12 @@ final class Subscription
     public function price(): Price
     {
         return Price::findOrFail($this->price_id);
+    }
+
+    /** The price swapAtPeriodEnd() scheduled for the next period, if any. */
+    public function scheduledPrice(): ?Price
+    {
+        return $this->scheduled_price_id === null ? null : Price::findOrFail($this->scheduled_price_id);
     }
 
     public function customer(): Customer
@@ -126,24 +135,35 @@ final class Subscription
 
     // --- Changes -----------------------------------------------------------
 
-    /** Cancel at the end of the current period (or trial). */
+    /**
+     * Cancel at the end of the current period (or trial). A price change
+     * scheduled for that date is dropped: there is no next period to apply
+     * it to, and resume() brings back the current price, not the scheduled one.
+     */
     public function cancel(): self
     {
         if ($this->status === SubscriptionStatus::Incomplete) {
             return $this->cancelNow();
         }
-        Db::transaction(function (): void {
+        $scheduled = Db::transaction(function (): bool {
             $this->lock();
             if ($this->status === SubscriptionStatus::Canceled) {
                 throw new CleatException('The subscription is already canceled.');
             }
+            $alreadyScheduled = $this->cancel_at_period_end;
             Db::update('cleat_subscriptions', [
                 'cancel_at_period_end' => true,
                 'ends_at' => $this->current_period_end,
+                'scheduled_price_id' => null,
                 'updated_at' => Cleat::now(),
             ], ['id' => $this->id]);
+            return !$alreadyScheduled;
         });
-        return $this->refresh();
+        $this->refresh();
+        if ($scheduled && (bool) Cleat::config('emails.subscription_canceled')) {
+            Messages::subscriptionCanceled($this, $this->customer(), immediately: false);
+        }
+        return $this;
     }
 
     /**
@@ -153,11 +173,13 @@ final class Subscription
      */
     public function cancelNow(): self
     {
-        $canceled = Db::transaction(function (): bool {
+        $wasIncomplete = false;
+        $canceled = Db::transaction(function () use (&$wasIncomplete): bool {
             $this->lock();
             if ($this->status === SubscriptionStatus::Canceled) {
                 return false;
             }
+            $wasIncomplete = $this->status === SubscriptionStatus::Incomplete;
             $now = Cleat::now();
             if ($this->status === SubscriptionStatus::Incomplete) {
                 $inFlight = "SELECT 1 FROM cleat_charges c WHERE c.invoice_id = cleat_invoices.id AND (c.status IN ('pending', 'held') OR "
@@ -172,6 +194,7 @@ final class Subscription
                 'status' => SubscriptionStatus::Canceled,
                 'canceled_at' => $now,
                 'ends_at' => $now,
+                'scheduled_price_id' => null,
                 'updated_at' => $now,
             ], ['id' => $this->id]);
             Db::run(
@@ -183,6 +206,10 @@ final class Subscription
         $this->refresh();
         if ($canceled) {
             Cleat::events()->dispatch(new SubscriptionCanceled($this));
+            // A subscription that never started has nothing to end: no email.
+            if (!$wasIncomplete && (bool) Cleat::config('emails.subscription_canceled')) {
+                Messages::subscriptionCanceled($this, $this->customer(), immediately: true);
+            }
         }
         return $this;
     }
@@ -198,6 +225,47 @@ final class Subscription
             }
             Db::update('cleat_subscriptions', ['cancel_at_period_end' => false, 'ends_at' => null, 'updated_at' => Cleat::now()], ['id' => $this->id]);
         });
+        return $this->refresh();
+    }
+
+    /**
+     * Move to another price when the current period (or trial) ends, with no
+     * proration and nothing charged now: the usual way to downgrade. The
+     * Runner applies it as it rolls the period, so the renewal invoice is for
+     * the new price and the new period follows the new price's interval.
+     * Asking for the current price clears a scheduled change; a later call
+     * replaces an earlier one; an immediate swap(), cancel() or cancelNow()
+     * clears it.
+     */
+    public function swapAtPeriodEnd(string $lookupKey): self
+    {
+        $newPrice = Price::resolve($lookupKey);
+        if (!$newPrice->isRecurring() || !$newPrice->is_active) {
+            throw new InvalidArgumentException(sprintf('Price "%s" must be an active recurring price.', $lookupKey));
+        }
+        Db::transaction(function () use ($newPrice): void {
+            $this->lock();
+            if (!in_array($this->status, [SubscriptionStatus::Active, SubscriptionStatus::Trialing], true)) {
+                throw new CleatException(sprintf('Only active or trialing subscriptions can schedule a price change; this one is %s.', $this->status->value));
+            }
+            if ($this->cancel_at_period_end) {
+                throw new CleatException('The subscription is set to cancel at the end of its period. Resume it before scheduling a price change.');
+            }
+            if ($this->price()->currency !== $newPrice->currency) {
+                throw new InvalidArgumentException('Cannot swap between prices in different currencies.');
+            }
+            Db::update('cleat_subscriptions', [
+                'scheduled_price_id' => $newPrice->id === $this->price_id ? null : $newPrice->id,
+                'updated_at' => Cleat::now(),
+            ], ['id' => $this->id]);
+        });
+        return $this->refresh();
+    }
+
+    /** Drop a price change scheduled by swapAtPeriodEnd(). */
+    public function cancelScheduledSwap(): self
+    {
+        Db::update('cleat_subscriptions', ['scheduled_price_id' => null, 'updated_at' => Cleat::now()], ['id' => $this->id]);
         return $this->refresh();
     }
 
@@ -278,7 +346,8 @@ final class Subscription
                 }
             }
 
-            Db::update('cleat_subscriptions', ['price_id' => $newPrice->id, 'updated_at' => $now], ['id' => $this->id]);
+            // An immediate change replaces any change scheduled for the period end.
+            Db::update('cleat_subscriptions', ['price_id' => $newPrice->id, 'scheduled_price_id' => null, 'updated_at' => $now], ['id' => $this->id]);
             return $invoice;
         });
 
@@ -366,6 +435,8 @@ final class Subscription
         $this->canceled_at = $fresh->canceled_at;
         $this->ends_at = $fresh->ends_at;
         $this->updated_at = $fresh->updated_at;
+        $this->scheduled_price_id = $fresh->scheduled_price_id;
+        $this->trial_ending_notified_at = $fresh->trial_ending_notified_at;
     }
 
     /** @param array<string, mixed> $row */
@@ -388,6 +459,8 @@ final class Subscription
             $row['application_fee_percent'] !== null ? (string) $row['application_fee_percent'] : null,
             Db::date($row['created_at']),
             Db::date($row['updated_at']),
+            isset($row['scheduled_price_id']) ? (int) $row['scheduled_price_id'] : null,
+            Db::date($row['trial_ending_notified_at'] ?? null),
         );
     }
 }
