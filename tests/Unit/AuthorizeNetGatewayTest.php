@@ -6,6 +6,7 @@ namespace Cleat\Tests\Unit;
 
 use Cleat\Enums\GatewayStatus;
 use Cleat\Gateway\AuthorizeNetGateway;
+use Cleat\Gateway\StoredCredential;
 use Cleat\Support\Log;
 use PHPUnit\Framework\TestCase;
 
@@ -78,6 +79,67 @@ final class AuthorizeNetGatewayTest extends TestCase
         $this->assertSame('10.50', $tx['amount']);
         $this->assertSame(['email' => 'buyer@example.com'], $tx['customer']);
         $this->assertSame('203.0.113.5', $tx['customerIP']);
+    }
+
+    /** Card-on-file fields: names, values and XSD position for every kind of stored-credential charge. */
+    public function test_stored_credential_fields_for_each_kind_of_charge(): void
+    {
+        $nti = '0TN1VE648DFCJSHQ81GZH9F';
+        $cases = [
+            'first CIT, subscription' => [StoredCredential::firstCustomerInitiated(recurring: true),
+                ['processingOptions' => ['isFirstRecurringPayment' => true]]],
+            'first CIT, card saved in testMode' => [StoredCredential::firstCustomerInitiated(recurring: false),
+                ['processingOptions' => ['isFirstSubsequentAuth' => true]]],
+            'later CIT' => [StoredCredential::customerInitiated(),
+                ['processingOptions' => ['isStoredCredentials' => true]]],
+            'MIT recurring' => [StoredCredential::recurring()->withOriginalNetworkTransId($nti),
+                ['transactionSettings' => ['setting' => ['settingName' => 'recurringBilling', 'settingValue' => 'true']],
+                 'processingOptions' => ['isSubsequentAuth' => true],
+                 'subsequentAuthInformation' => ['originalNetworkTransId' => $nti]]],
+            'MIT recurring, no original id' => [StoredCredential::recurring(),
+                ['transactionSettings' => ['setting' => ['settingName' => 'recurringBilling', 'settingValue' => 'true']],
+                 'processingOptions' => ['isSubsequentAuth' => true]]],
+            'MIT unscheduled' => [StoredCredential::unscheduled()->withOriginalNetworkTransId($nti),
+                ['processingOptions' => ['isSubsequentAuth' => true], 'subsequentAuthInformation' => ['originalNetworkTransId' => $nti]]],
+            'MIT resubmission' => [StoredCredential::resubmission()->withOriginalNetworkTransId($nti),
+                ['processingOptions' => ['isSubsequentAuth' => true], 'subsequentAuthInformation' => ['originalNetworkTransId' => $nti, 'reason' => 'resubmission']]],
+            'MIT resubmission, no original id' => [StoredCredential::resubmission(),
+                ['processingOptions' => ['isSubsequentAuth' => true], 'subsequentAuthInformation' => ['reason' => 'resubmission']]],
+        ];
+        foreach ($cases as $label => [$credential, $expected]) {
+            $this->respond($this->tx('1', '60000000100'));
+            $this->gateway()->chargeProfile('900001', '800001', 2900, 'CLT-000012', 'inv_12_attempt_1', $credential);
+            $tx = $this->requests[array_key_last($this->requests)]['body']['createTransactionRequest']['transactionRequest'];
+            $this->assertSame(array_merge(['transactionType', 'amount', 'profile', 'order'], array_keys($expected)), array_keys($tx), "$label: XSD order");
+            $this->assertSame($expected, array_diff_key($tx, array_flip(['transactionType', 'amount', 'profile', 'order'])), $label);
+        }
+
+        // A card saved with a liveMode validation already had its first transaction.
+        $this->assertSame(['processingOptions' => ['isStoredCredentials' => true]],
+            $this->gateway(sandbox: false)->storedCredentialFields(StoredCredential::firstCustomerInitiated(recurring: false)));
+        $this->assertSame(['processingOptions' => ['isFirstRecurringPayment' => true]],
+            $this->gateway(sandbox: false)->storedCredentialFields(StoredCredential::firstCustomerInitiated(recurring: true)));
+
+        // Without a StoredCredential the request is exactly what 0.1.1 sent.
+        $this->respond($this->tx('1', '60000000101'));
+        $this->gateway()->chargeProfile('900001', '800001', 2900, 'CLT-000012', 'k');
+        $this->assertSame(['transactionType', 'amount', 'profile', 'order'], array_keys($this->requests[array_key_last($this->requests)]['body']['createTransactionRequest']['transactionRequest']));
+    }
+
+    public function test_network_transaction_id_is_read_from_the_transaction_response(): void
+    {
+        $approved = $this->tx('1', '60000000200');
+        $approved['transactionResponse']['networkTransId'] = '123456789NNNH';
+        $this->respond($approved);
+        $this->respond($this->tx('2', '60000000201', error: ['2', 'This transaction has been declined.']));
+        $odd = $this->tx('1', '60000000202');
+        $odd['transactionResponse']['networkTransId'] = 'not/a valid-id';
+        $this->respond($odd);
+        $g = $this->gateway();
+
+        $this->assertSame('123456789NNNH', $g->chargeProfile('1', '2', 100, 'CLT-1', 'k1', StoredCredential::customerInitiated())->networkTransactionId);
+        $this->assertNull($g->chargeProfile('1', '2', 100, 'CLT-1', 'k2')->networkTransactionId, 'none in the response');
+        $this->assertNull($g->chargeProfile('1', '2', 100, 'CLT-1', 'k3')->networkTransactionId, 'not in the documented shape');
     }
 
     public function test_response_codes_map_to_statuses(): void
@@ -153,7 +215,8 @@ final class AuthorizeNetGatewayTest extends TestCase
     public function test_payment_profile_then_card_details(): void
     {
         $this->respond(['customerProfileId' => '1505', 'customerPaymentProfileId' => '1504', 'validationDirectResponse' => '1,1,1,This transaction has been approved.', 'messages' => ['resultCode' => 'Ok', 'message' => [['code' => 'I00001', 'text' => 'Successful.']]]]);
-        $this->respond(['paymentProfile' => ['customerPaymentProfileId' => '1504', 'payment' => ['creditCard' => ['cardNumber' => 'XXXX4242', 'expirationDate' => '2029-07', 'cardType' => 'Visa']]], 'messages' => ['resultCode' => 'Ok', 'message' => [['code' => 'I00001', 'text' => 'Successful.']]]]);
+        $this->respond(['paymentProfile' => ['customerPaymentProfileId' => '1504', 'payment' => ['creditCard' => ['cardNumber' => 'XXXX4242', 'expirationDate' => '2029-07', 'cardType' => 'Visa']],
+            'originalNetworkTransId' => '0TN1VE648DFCJSHQ81GZH9F', 'originalAuthAmount' => 0], 'messages' => ['resultCode' => 'Ok', 'message' => [['code' => 'I00001', 'text' => 'Successful.']]]]);
 
         $result = $this->gateway(sandbox: false)->createPaymentProfile('1505', ['dataDescriptor' => 'COMMON.ACCEPT.INAPP.PAYMENT', 'dataValue' => 'OPAQUE-VALUE-456']);
 
@@ -161,6 +224,7 @@ final class AuthorizeNetGatewayTest extends TestCase
         $this->assertSame('Visa', $result->get('card_brand'));
         $this->assertSame('4242', $result->get('card_last_four'));
         $this->assertSame('2029-07', $result->get('card_exp'));
+        $this->assertSame('0TN1VE648DFCJSHQ81GZH9F', $result->get('original_network_transaction_id'), 'from the liveMode validation, kept by CIM');
         $create = $this->requests[0]['body']['createCustomerPaymentProfileRequest'];
         $this->assertSame(AuthorizeNetGateway::PRODUCTION_URL, $this->requests[0]['url']);
         $this->assertSame(['merchantAuthentication', 'customerProfileId', 'paymentProfile', 'validationMode'], array_keys($create));

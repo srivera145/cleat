@@ -342,6 +342,6 @@ final class ReviewRegressionTest extends TestCase
 
     private function sign(string $body): string
     {
-        return 'sha512=' . strtoupper(hash_hmac('sha512', $body, hex2bin(self::SIGNATURE_KEY)));
+        return 'sha512=' . strtoupper(hash_hmac('sha512', $body, self::SIGNATURE_KEY));
     }
 }

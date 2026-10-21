@@ -23,6 +23,9 @@ use SensitiveParameter;
  *     are never logged or stored. Only response codes are logged.
  *   - 30 second timeout. A timeout returns GatewayResult::timeout() and is
  *     never retried here.
+ *   - Every charge of a saved card carries card-on-file indicators (see
+ *     storedCredentialFields()), and each transaction's networkTransId is
+ *     returned on the result.
  */
 final class AuthorizeNetGateway implements GatewayInterface
 {
@@ -83,7 +86,7 @@ final class AuthorizeNetGateway implements GatewayInterface
                 ],
                 'defaultPaymentProfile' => true,
             ],
-            'validationMode' => $this->sandbox ? 'testMode' : 'liveMode',
+            'validationMode' => $this->validationMode(),
         ]);
         unset($opaqueData);
         if ($r instanceof GatewayResult) {
@@ -109,6 +112,9 @@ final class AuthorizeNetGateway implements GatewayInterface
             $data['card_brand'] = isset($card['cardType']) ? (string) $card['cardType'] : null;
             $exp = (string) ($card['expirationDate'] ?? '');
             $data['card_exp'] = preg_match('/^\d{4}-\d{2}$/D', $exp) === 1 ? $exp : null;
+            // A liveMode validation is the card's first stored-credential
+            // transaction; CIM keeps its network id on the payment profile.
+            $data['original_network_transaction_id'] = self::networkTransId($details['paymentProfile']['originalNetworkTransId'] ?? null);
         } else {
             Log::warning('Authorize.net: payment profile created but card details could not be read', ['payment_profile_id' => $paymentProfileId]);
         }
@@ -133,8 +139,9 @@ final class AuthorizeNetGateway implements GatewayInterface
         int $amountCents,
         string $invoiceNumber,
         string $idempotencyKey,
+        ?StoredCredential $storedCredential = null,
     ): GatewayResult {
-        return $this->transaction($idempotencyKey, [
+        $tx = [
             'transactionType' => 'authCaptureTransaction',
             'amount' => self::amount($amountCents),
             'profile' => [
@@ -142,7 +149,69 @@ final class AuthorizeNetGateway implements GatewayInterface
                 'paymentProfile' => ['paymentProfileId' => $paymentProfileId],
             ],
             'order' => ['invoiceNumber' => self::clip($invoiceNumber, 20)],
-        ]);
+        ];
+        if ($storedCredential !== null) {
+            $tx += $this->storedCredentialFields($storedCredential);
+        }
+        return $this->transaction($idempotencyKey, $tx);
+    }
+
+    /**
+     * The card-on-file fields for a stored-credential charge, keyed by their
+     * transactionRequest element, in XSD order (transactionSettings, then
+     * processingOptions, then subsequentAuthInformation, all after customerIP).
+     * Follows Authorize.net's card-on-file guide
+     * (developer.authorize.net/api/reference/features/card-on-file.html):
+     *
+     *   first CIT, subscription      processingOptions.isFirstRecurringPayment
+     *   first CIT, otherwise         processingOptions.isFirstSubsequentAuth, but
+     *                                isStoredCredentials when the card was saved
+     *                                with a liveMode validation: that validation
+     *                                already was the first transaction
+     *   later CIT                    processingOptions.isStoredCredentials
+     *   MIT, recurring               transactionSettings recurringBilling=true
+     *                                + processingOptions.isSubsequentAuth
+     *                                + subsequentAuthInformation.originalNetworkTransId
+     *   MIT, unscheduled or retry    processingOptions.isSubsequentAuth
+     *                                + subsequentAuthInformation.originalNetworkTransId, reason
+     *
+     * A recurring MIT carries isSubsequentAuth as well as recurringBilling.
+     * The guide shows recurringBilling alone, but the sandbox then records
+     * the transaction without the originalNetworkTransId it was sent; with
+     * both flags it keeps recurringBilling and the original id (checked
+     * 2026-10-07, see SANDBOX.md).
+     *
+     * originalNetworkTransId is left out when it is not known; CIM then sends
+     * the one stored with the payment profile, if it has one.
+     * originalAuthAmount is never sent: CIM stores it with the payment profile
+     * and sends it itself.
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    public function storedCredentialFields(StoredCredential $credential): array
+    {
+        if ($credential->isCustomerInitiated()) {
+            $flag = match (true) {
+                $credential->isFirst && $credential->isRecurring() => 'isFirstRecurringPayment',
+                $credential->isFirst && $this->validationMode() === 'testMode' => 'isFirstSubsequentAuth',
+                default => 'isStoredCredentials',
+            };
+            return ['processingOptions' => [$flag => true]];
+        }
+
+        $fields = [];
+        if ($credential->isRecurring()) {
+            $fields['transactionSettings'] = ['setting' => ['settingName' => 'recurringBilling', 'settingValue' => 'true']];
+        }
+        $fields['processingOptions'] = ['isSubsequentAuth' => true];
+        $subsequent = array_filter([
+            'originalNetworkTransId' => $credential->originalNetworkTransId,
+            'reason' => $credential->reason,
+        ], static fn (?string $v) => $v !== null);
+        if ($subsequent !== []) {
+            $fields['subsequentAuthInformation'] = $subsequent;
+        }
+        return $fields;
     }
 
     public function chargeToken(
@@ -340,7 +409,24 @@ final class AuthorizeNetGateway implements GatewayInterface
                 'account_type' => $tr['accountType'] ?? null,
                 'auth_code' => $tr['authCode'] ?? null,
             ],
+            self::networkTransId($tr['networkTransId'] ?? null),
         );
+    }
+
+    /** testMode in the sandbox (no transaction), liveMode in production (a validation authorization). */
+    private function validationMode(): string
+    {
+        return $this->sandbox ? 'testMode' : 'liveMode';
+    }
+
+    /** A network transaction id from a response, or null when absent or not in the documented shape. */
+    private static function networkTransId(mixed $value): ?string
+    {
+        if (!is_string($value) && !is_int($value)) {
+            return null;
+        }
+        $value = trim((string) $value);
+        return $value !== '' && StoredCredential::isNetworkTransId($value) ? $value : null;
     }
 
     /**

@@ -21,22 +21,32 @@ interface GatewayInterface
      * Attach a tokenized card to a customer profile and make it the default.
      *
      * @param array{dataDescriptor: string, dataValue: string} $opaqueData
-     * data: payment_profile_id, card_brand, card_last_four, card_exp (YYYY-MM)
+     * data: payment_profile_id, card_brand, card_last_four, card_exp (YYYY-MM),
+     * and original_network_transaction_id when saving the card already made a
+     * stored-credential transaction (a live validation), else null
      */
     public function createPaymentProfile(string $profileId, array $opaqueData): GatewayResult;
 
     public function deletePaymentProfile(string $profileId, string $paymentProfileId): GatewayResult;
 
+    /**
+     * Charge a saved card. $storedCredential says who started the charge and
+     * why (card-on-file indicators); Cleat passes it on every charge. Null
+     * sends no indicators. The result's networkTransactionId is the network's
+     * id for the charge, when the gateway returns one.
+     */
     public function chargeProfile(
         string $profileId,
         string $paymentProfileId,
         int $amountCents,
         string $invoiceNumber,
         string $idempotencyKey,
+        ?StoredCredential $storedCredential = null,
     ): GatewayResult;
 
     /**
-     * Charge a single-use Accept.js token without storing the card.
+     * Charge a single-use Accept.js token without storing the card. Not a
+     * stored-credential transaction, so it carries no card-on-file indicators.
      *
      * @param array{dataDescriptor: string, dataValue: string} $opaqueData
      */

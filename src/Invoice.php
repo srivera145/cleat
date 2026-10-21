@@ -19,10 +19,12 @@ use Cleat\Exceptions\CleatException;
 use Cleat\Exceptions\NotFoundException;
 use Cleat\Exceptions\PaymentFailedException;
 use Cleat\Gateway\GatewayResult;
+use Cleat\Gateway\StoredCredential;
 use Cleat\Mail\Messages;
 use Cleat\Support\Db;
 use Cleat\Support\Log;
 use Cleat\Support\OpaqueData;
+use Cleat\Support\Schema;
 use Cleat\Support\View;
 use DateTimeImmutable;
 use Throwable;
@@ -283,24 +285,17 @@ final class Invoice
      * idempotency key "inv_{id}_attempt_{n}". Returns the charge (succeeded
      * or held), or null when nothing was due.
      *
+     * $storedCredential sets the card-on-file indicators. The default is a
+     * merchant-initiated, unscheduled charge; the runner passes recurring()
+     * for renewals and resubmission() for dunning retries, and a new
+     * subscription's first payment is customer-initiated.
+     *
      * @throws PaymentFailedException on decline, error, timeout or no card on file
      * @throws ChargeInProgressException when another charge is pending or held
      */
-    public function pay(?string $ip = null): ?Charge
+    public function pay(?string $ip = null, ?StoredCredential $storedCredential = null): ?Charge
     {
-        $customer = $this->customer();
-        return $this->collect(self::INITIATOR_AUTOMATIC, ChargeSource::StoredProfile, $ip, function (Charge $charge) use ($customer): GatewayResult {
-            if (!$customer->hasPaymentMethod()) {
-                return GatewayResult::error('no_payment_method', 'The customer has no saved payment method.');
-            }
-            return Cleat::gateway()->chargeProfile(
-                (string) $customer->gateway_customer_id,
-                (string) $customer->gateway_payment_id,
-                $charge->amount,
-                (string) $this->number,
-                $charge->idempotency_key,
-            );
-        });
+        return $this->chargeSavedCard(self::INITIATOR_AUTOMATIC, $ip, $storedCredential ?? StoredCredential::unscheduled());
     }
 
     /**
@@ -324,7 +319,9 @@ final class Invoice
             } catch (PaymentFailedException $e) {
                 throw new PaymentFailedException($e->result, $this, null, $this->paymentUrl());
             }
-            return $this->payWithSavedCard($ip);
+            // The first charge of the card just saved. On a subscription's
+            // invoice the card goes on to pay the renewals.
+            return $this->chargeSavedCard(self::INITIATOR_CUSTOMER, $ip, StoredCredential::firstCustomerInitiated($this->subscription_id !== null));
         }
 
         return $this->collect(self::INITIATOR_CUSTOMER, ChargeSource::OneTimeToken, $ip, function (Charge $charge) use ($opaque, $customer, $ip): GatewayResult {
@@ -340,19 +337,7 @@ final class Invoice
      */
     public function payWithSavedCard(string $ip): ?Charge
     {
-        $customer = $this->customer();
-        return $this->collect(self::INITIATOR_CUSTOMER, ChargeSource::StoredProfile, $ip, function (Charge $charge) use ($customer): GatewayResult {
-            if (!$customer->hasPaymentMethod()) {
-                return GatewayResult::error('no_payment_method', 'The customer has no saved payment method.');
-            }
-            return Cleat::gateway()->chargeProfile(
-                (string) $customer->gateway_customer_id,
-                (string) $customer->gateway_payment_id,
-                $charge->amount,
-                (string) $this->number,
-                $charge->idempotency_key,
-            );
-        });
+        return $this->chargeSavedCard(self::INITIATOR_CUSTOMER, $ip, StoredCredential::customerInitiated($this->subscription_id !== null));
     }
 
     /**
@@ -482,6 +467,46 @@ final class Invoice
     // --- Internals ---------------------------------------------------------
 
     /**
+     * Charge the saved card with its card-on-file indicators. A
+     * merchant-initiated charge carries the card's original network
+     * transaction id; when the card has none yet it goes without, with a
+     * notice. An approved charge's network transaction id becomes the card's
+     * original id if it has none.
+     *
+     * @throws PaymentFailedException
+     */
+    private function chargeSavedCard(string $initiator, ?string $ip, StoredCredential $credential): ?Charge
+    {
+        $customer = $this->customer();
+        $paymentProfileId = $customer->gateway_payment_id;
+        if ($credential->isMerchantInitiated()) {
+            $credential = $credential->withOriginalNetworkTransId($customer->original_network_transaction_id);
+        }
+
+        $charge = $this->collect($initiator, ChargeSource::StoredProfile, $ip, function (Charge $charge) use ($customer, $credential): GatewayResult {
+            if (!$customer->hasPaymentMethod()) {
+                return GatewayResult::error('no_payment_method', 'The customer has no saved payment method.');
+            }
+            if ($credential->isMerchantInitiated() && $credential->originalNetworkTransId === null) {
+                $customer->noticeMissingNetworkTransactionId();
+            }
+            return Cleat::gateway()->chargeProfile(
+                (string) $customer->gateway_customer_id,
+                (string) $customer->gateway_payment_id,
+                $charge->amount,
+                (string) $this->number,
+                $charge->idempotency_key,
+                $credential,
+            );
+        });
+
+        if ($charge !== null && $charge->status === ChargeStatus::Succeeded && $charge->network_transaction_id !== null && $paymentProfileId !== null) {
+            $customer->rememberNetworkTransactionId($paymentProfileId, $charge->network_transaction_id);
+        }
+        return $charge;
+    }
+
+    /**
      * @param callable(Charge): GatewayResult $call
      * @throws PaymentFailedException
      */
@@ -493,6 +518,7 @@ final class Invoice
                 . 'committed before the gateway is called, or a crash could charge twice.'
             );
         }
+        Schema::assertMigrated(Cleat::pdo());
 
         // Phase 0: an earlier attempt whose answer never arrived may have
         // captured. Ask the gateway before trying again.

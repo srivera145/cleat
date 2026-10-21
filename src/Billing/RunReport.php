@@ -8,6 +8,7 @@ namespace Cleat\Billing;
 final class RunReport
 {
     public bool $skipped = false;
+    public int $trialEndingNotices = 0;
     public int $trialsConverted = 0;
     public int $renewals = 0;
     public int $paymentsSucceeded = 0;

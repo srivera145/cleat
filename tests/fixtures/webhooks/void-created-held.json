@@ -1,0 +1,5 @@
+{
+    "source": "Real net.authorize.payment.void.created notification captured from the Authorize.net sandbox on 2026-10-07, when a transaction held by the FDS Amount Filter was declined in the merchant interface (void.created arrived ~4 ms before fraud.declined). Body byte-for-byte as delivered; signature recomputed with tests/Support/TestCase::SIGNATURE_KEY as the hex string.",
+    "signature": "sha512=5E57E1DCE012A9D3E008950BFDCC18AB462A32B846A4296230B4EAD6BE30DE695FBA954B6CDE63529BA9617E6A4F0D1AA03937646BCC23D96EECE45FE58014A3",
+    "body": "{\"notificationId\":\"af498ede-8503-474d-b2f6-c892b9b873d7\",\"eventType\":\"net.authorize.payment.void.created\",\"eventDate\":\"2026-10-07T21:38:08.5227415Z\",\"webhookId\":\"6b2c4aa1-db4d-4a62-871a-69742e40c1c5\",\"payload\":{\"responseCode\":1,\"avsResponse\":\"Y\",\"authAmount\":650.00,\"fraudList\":[{\"fraudFilter\":\"Amount Filter\",\"fraudAction\":\"authAndHold\"}],\"invoiceNumber\":\"CLT-000016\",\"entityName\":\"transaction\",\"id\":\"80060642126\"}}"
+}

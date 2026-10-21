@@ -8,9 +8,12 @@ use Cleat\Cleat;
 use Cleat\Enums\InvoiceStatus;
 use Cleat\Enums\SubscriptionStatus;
 use Cleat\Events\SubscriptionCanceled;
+use Cleat\Events\TrialEnding;
 use Cleat\Exceptions\ChargeInProgressException;
 use Cleat\Exceptions\PaymentFailedException;
+use Cleat\Gateway\StoredCredential;
 use Cleat\Invoice;
+use Cleat\Mail\Messages;
 use Cleat\Security\RateLimiter;
 use Cleat\Subscription;
 use Cleat\Support\Db;
@@ -48,6 +51,7 @@ final class Runner
         $previousClock = Cleat::clock();
         Cleat::setClock(new FrozenClock($now));
         try {
+            $this->noticeTrialsEnding($now, $report);
             $this->convertTrials($now, $report);
             $this->renewSubscriptions($now, $report);
             $this->cancelAtPeriodEnd($now, $report);
@@ -59,6 +63,42 @@ final class Runner
             Db::unlock('cleat:runner');
         }
         return $report;
+    }
+
+    /**
+     * 0. Trials ending within trial_ending_days: the TrialEnding event and the
+     * trial_ending email, once per subscription. Claimed with a conditional
+     * update, so two runs (or two servers) never send it twice. A trial set to
+     * cancel gets no notice: nothing will be charged.
+     */
+    private function noticeTrialsEnding(DateTimeImmutable $now, RunReport $report): void
+    {
+        $days = Cleat::config('trial_ending_days');
+        if ($days === null) {
+            return;
+        }
+        $ids = Db::all(
+            "SELECT id FROM cleat_subscriptions WHERE status = 'trialing' AND cancel_at_period_end = 0 AND trial_ending_notified_at IS NULL
+               AND trial_ends_at > ? AND trial_ends_at <= ? ORDER BY trial_ends_at, id",
+            [$now, $now->modify(sprintf('+%d days', (int) $days))],
+        );
+        foreach ($ids as $row) {
+            $this->guard($report, 'trial notice ' . $row['id'], function () use ($row, $now, $report): void {
+                $claimed = Db::run(
+                    "UPDATE cleat_subscriptions SET trial_ending_notified_at = ?, updated_at = ? WHERE id = ? AND status = 'trialing' AND trial_ending_notified_at IS NULL",
+                    [$now, $now, (int) $row['id']],
+                )->rowCount();
+                if ($claimed !== 1) {
+                    return;
+                }
+                $subscription = Subscription::findOrFail((int) $row['id']);
+                $report->trialEndingNotices++;
+                Cleat::events()->dispatch(new TrialEnding($subscription));
+                if ((bool) Cleat::config('emails.trial_ending')) {
+                    Messages::trialEnding($subscription, $subscription->customer());
+                }
+            });
+        }
     }
 
     /** 1. Trials that have ended: invoice the first paid period and charge it. */
@@ -186,11 +226,15 @@ final class Runner
                 return null;
             }
 
-            $price = $subscription->price();
+            // A change scheduled with swapAtPeriodEnd() takes effect here: the new
+            // period follows the new price's interval and is invoiced at its amount.
+            $price = $subscription->scheduledPrice() ?? $subscription->price();
             $start = $subscription->current_period_end;
             $anchor = $subscription->anchor_day;
             $end = Period::advance($start, $price->billing_interval, $price->interval_count, $anchor);
             Db::update('cleat_subscriptions', [
+                'price_id' => $price->id,
+                'scheduled_price_id' => null,
                 'current_period_start' => $start,
                 'current_period_end' => $end,
                 'updated_at' => $now,
@@ -203,10 +247,11 @@ final class Runner
         });
     }
 
+    /** A renewal or trial conversion: a merchant-initiated recurring charge. */
     private function charge(Invoice $invoice, RunReport $report): void
     {
         try {
-            $invoice->pay();
+            $invoice->pay(storedCredential: StoredCredential::recurring());
             $report->paymentsSucceeded++;
         } catch (PaymentFailedException) {
             $report->paymentsFailed++;
