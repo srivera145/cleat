@@ -4,7 +4,7 @@ All notable changes to Cleat are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Cleat uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.1.3] - Unreleased
+## [0.1.3] - 2026-10-25
 
 Price changes at the end of a period, and the trial-ending and
 subscription-canceled emails. Run `database/migrations/003_period_end_changes.sql`
@@ -169,6 +169,7 @@ First release of Cleat Billing.
 - The Authorize.net gateway has not yet been run against a live sandbox. See
   "Not yet verified against a live sandbox" in the README.
 
+[0.1.3]: https://github.com/srivera145/cleat/releases/tag/v0.1.3
 [0.1.2]: https://github.com/srivera145/cleat/releases/tag/v0.1.2
 [0.1.1]: https://github.com/srivera145/cleat/releases/tag/v0.1.1
 [0.1.0]: https://github.com/srivera145/cleat/releases/tag/v0.1.0
