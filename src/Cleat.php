@@ -27,7 +27,7 @@ use PDO;
  */
 final class Cleat
 {
-    public const VERSION = '0.1.0';
+    public const VERSION = '0.1.3';
 
     /** Used only when gateway = 'fake' and no app_key is set. Never secret. */
     private const FAKE_MODE_APP_KEY = 'cleat-fake-mode-insecure-app-key-do-not-use-in-production';
@@ -70,6 +70,7 @@ final class Cleat
         self::$events = null;
         self::$clock = null;
         Log::setLogger(null);
+        Customer::resetNotices();
     }
 
     public static function isConfigured(): bool
@@ -298,6 +299,14 @@ final class Cleat
         }
         if (!is_int($c['grace_days']) || $c['grace_days'] < 0) {
             $fail('grace_days must be a non-negative integer.');
+        }
+        if ($c['trial_ending_days'] !== null && (!is_int($c['trial_ending_days']) || $c['trial_ending_days'] < 1 || $c['trial_ending_days'] > 30)) {
+            $fail('trial_ending_days must be an integer from 1 to 30, or null for no notice.');
+        }
+        foreach (['trial_ending', 'subscription_canceled'] as $k) {
+            if (!is_bool($c['emails'][$k] ?? null)) {
+                $fail("emails.$k must be true or false.");
+            }
         }
         foreach (['per_ip', 'per_link', 'failures_per_ip'] as $k) {
             $pair = $c['rate_limits'][$k] ?? null;

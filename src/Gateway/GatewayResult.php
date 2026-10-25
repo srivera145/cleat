@@ -15,6 +15,11 @@ use Cleat\Enums\GatewayStatus;
  * $data carries call-specific extras: profile ids, card brand and last four,
  * masked account number.
  *
+ * $networkTransactionId is the card network's id for the transaction
+ * (Authorize.net's transactionResponse.networkTransId), when the gateway
+ * returns one. The first one on a saved card is sent back as the original id
+ * on later merchant-initiated charges.
+ *
  * $raw is the decoded gateway response. Responses never contain secrets or
  * full card numbers; requests, which do contain credentials, are never kept.
  */
@@ -33,6 +38,7 @@ final class GatewayResult
         public readonly ?string $reasonText = null,
         public readonly array $raw = [],
         public readonly array $data = [],
+        public readonly ?string $networkTransactionId = null,
     ) {
     }
 

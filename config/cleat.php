@@ -46,6 +46,16 @@ return [
     ],
     'grace_days' => 0,
 
+    // 0.1.3: the Runner fires TrialEnding (and sends the trial_ending email)
+    // this many days before a trial converts. null = no notice.
+    'trial_ending_days' => 3,
+
+    // 0.1.3: lifecycle emails beyond the invoice, receipt and dunning ones.
+    'emails' => [
+        'trial_ending'          => true, // trial_ending_days before a trial converts
+        'subscription_canceled' => true, // on cancel(), cancelNow() and a final dunning cancel
+    ],
+
     // extra: where the hosted pages load Deck from. A path on your own site
     // ('/assets/deck/deck.min.css') works too; the CSP follows whatever origin
     // this points at.

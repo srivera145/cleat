@@ -8,9 +8,11 @@ use Cleat\Enums\SubscriptionStatus;
 use Cleat\Exceptions\CleatException;
 use Cleat\Exceptions\NotFoundException;
 use Cleat\Exceptions\PaymentFailedException;
+use Cleat\Gateway\StoredCredential;
 use Cleat\Support\Db;
 use Cleat\Support\Log;
 use Cleat\Support\OpaqueData;
+use Cleat\Support\Schema;
 use DateTimeImmutable;
 use InvalidArgumentException;
 use Throwable;
@@ -20,9 +22,16 @@ use Throwable;
  *
  * user_id is the host app's user. A guest customer (user_id null) is created
  * by a payment link checkout; forUser() can attach a guest to a user later.
+ *
+ * original_network_transaction_id belongs to the saved card: the card
+ * network's id for its first stored-credential transaction, sent with every
+ * merchant-initiated charge. It is cleared whenever the card changes.
  */
 final class Customer
 {
+    /** @var array<int, true> customers whose missing original network transaction id was already logged */
+    private static array $missingNetworkTransIdLogged = [];
+
     public function __construct(
         public readonly int $id,
         public ?int $user_id,
@@ -36,6 +45,7 @@ final class Customer
         public ?string $card_exp,
         public readonly DateTimeImmutable $created_at,
         public DateTimeImmutable $updated_at,
+        public ?string $original_network_transaction_id = null,
     ) {
     }
 
@@ -167,6 +177,7 @@ final class Customer
     public function updatePaymentMethod(array $opaqueData): self
     {
         $opaque = OpaqueData::from($opaqueData);
+        Schema::assertMigrated(Cleat::pdo());
         $profileId = $this->ensureGatewayProfile();
         $result = Cleat::gateway()->createPaymentProfile($profileId, $opaque);
         unset($opaque, $opaqueData);
@@ -181,11 +192,17 @@ final class Customer
         }
 
         $previous = $this->gateway_payment_id;
+        // A new card starts a new stored-credential history. Its original id is
+        // known now only if saving it ran a live validation; otherwise the
+        // first approved charge provides it. The same card again keeps its id.
+        $networkTransId = $result->get('original_network_transaction_id');
+        $networkTransId = is_string($networkTransId) && StoredCredential::isNetworkTransId($networkTransId) ? $networkTransId : null;
         $fields = [
             'gateway_payment_id' => $paymentProfileId,
             'card_brand' => self::clean($result->get('card_brand'), 32),
             'card_last_four' => self::clean($result->get('card_last_four'), 4),
             'card_exp' => self::clean($result->get('card_exp'), 7),
+            'original_network_transaction_id' => $paymentProfileId === $previous ? ($this->original_network_transaction_id ?? $networkTransId) : $networkTransId,
             'updated_at' => Cleat::now(),
         ];
         Db::transaction(fn () => Db::update('cleat_customers', $fields, ['id' => $this->id]));
@@ -193,6 +210,7 @@ final class Customer
         $this->card_brand = $fields['card_brand'];
         $this->card_last_four = $fields['card_last_four'];
         $this->card_exp = $fields['card_exp'];
+        $this->original_network_transaction_id = $fields['original_network_transaction_id'];
         $this->updated_at = $fields['updated_at'];
 
         if ($previous !== null && $previous !== $paymentProfileId) {
@@ -209,10 +227,57 @@ final class Customer
     {
         Db::update('cleat_customers', [
             'gateway_payment_id' => null, 'card_brand' => null, 'card_last_four' => null, 'card_exp' => null,
-            'updated_at' => Cleat::now(),
+            'original_network_transaction_id' => null, 'updated_at' => Cleat::now(),
         ], ['id' => $this->id]);
         $this->gateway_payment_id = $this->card_brand = $this->card_last_four = $this->card_exp = null;
+        $this->original_network_transaction_id = null;
         return $this;
+    }
+
+    /**
+     * @internal Keep the network transaction id of an approved charge of the
+     * saved card as the card's original id, unless it already has one. Only
+     * while $paymentProfileId (the card that was charged) is still the saved
+     * card: a card replaced mid-charge never inherits the old card's id.
+     */
+    public function rememberNetworkTransactionId(string $paymentProfileId, string $networkTransactionId): void
+    {
+        if (!StoredCredential::isNetworkTransId($networkTransactionId)) {
+            return;
+        }
+        $updated = Db::run(
+            'UPDATE cleat_customers SET original_network_transaction_id = ?, updated_at = ?
+             WHERE id = ? AND gateway_payment_id = ? AND original_network_transaction_id IS NULL',
+            [$networkTransactionId, Cleat::now(), $this->id, $paymentProfileId],
+        )->rowCount();
+        if ($updated === 1) {
+            $this->original_network_transaction_id = $networkTransactionId;
+        }
+    }
+
+    /**
+     * @internal A merchant-initiated charge is about to go out without the
+     * card's original network transaction id (a card saved before 0.1.2, or
+     * one never charged since it was saved, e.g. during a trial). Logged once
+     * per customer per process; the charge's own id is kept once it is
+     * approved, so the notice stops by itself.
+     */
+    public function noticeMissingNetworkTransactionId(): void
+    {
+        if (isset(self::$missingNetworkTransIdLogged[$this->id])) {
+            return;
+        }
+        self::$missingNetworkTransIdLogged[$this->id] = true;
+        Log::info('Saved card has no original network transaction id yet; merchant-initiated charge sent without one', [
+            'customer_id' => $this->id,
+            'payment_profile_id' => $this->gateway_payment_id,
+        ]);
+    }
+
+    /** @internal Forget which notices were logged (Cleat::reset()). */
+    public static function resetNotices(): void
+    {
+        self::$missingNetworkTransIdLogged = [];
     }
 
     public function hasPaymentMethod(): bool
@@ -331,6 +396,7 @@ final class Customer
             $row['card_exp'] !== null ? (string) $row['card_exp'] : null,
             Db::date($row['created_at']),
             Db::date($row['updated_at']),
+            isset($row['original_network_transaction_id']) ? (string) $row['original_network_transaction_id'] : null,
         );
     }
 

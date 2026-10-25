@@ -92,7 +92,8 @@ abstract class HostedPage
             'style-src' => ["'self'", $nonce, $deck, ...($extra['style-src'] ?? [])],
             'img-src' => ["'self'", 'data:', $logo, ...($extra['img-src'] ?? [])],
             'font-src' => ["'self'", $deck],
-            'connect-src' => ["'self'", ...$acceptApi, ...($extra['connect-src'] ?? [])],
+            // Accept.js first fetches AcceptCore.js from its own host, then calls the API host.
+            'connect-src' => ["'self'", $acceptJs, ...$acceptApi, ...($extra['connect-src'] ?? [])],
             'frame-src' => [$acceptJs, ...($extra['frame-src'] ?? [])],
             'form-action' => ["'self'", $extraFormAction],
             'frame-ancestors' => ["'none'"],

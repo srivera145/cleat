@@ -1,0 +1,5 @@
+{
+    "source": "Real net.authorize.payment.authcapture.created notification captured from the Authorize.net sandbox on 2026-10-07 (body byte-for-byte as delivered). The signature is recomputed with tests/Support/TestCase::SIGNATURE_KEY, keyed the way Authorize.net keys it: the hex string itself.",
+    "signature": "sha512=DFB65AB08E921102496292B3018AF227C2A63973538FB808CA28C096CF5DBF453D620797F88F31BA0C2CA3ED9EB463F5D1C7ACC3133DF92E1B1CC38CEF0668B4",
+    "body": "{\"notificationId\":\"5e83309f-ecaf-45aa-bcf7-553ef3a0faed\",\"eventType\":\"net.authorize.payment.authcapture.created\",\"eventDate\":\"2026-10-07T20:46:39.4149544Z\",\"webhookId\":\"6b2c4aa1-db4d-4a62-871a-69742e40c1c5\",\"payload\":{\"responseCode\":1,\"authCode\":\"GLLSRQ\",\"avsResponse\":\"Y\",\"authAmount\":8.68,\"merchantReferenceId\":\"inv_11_customer_1\",\"invoiceNumber\":\"CLT-000011\",\"entityName\":\"transaction\",\"id\":\"80060639975\"}}"
+}
